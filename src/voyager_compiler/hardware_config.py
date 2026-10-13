@@ -265,7 +265,15 @@ class AcceleratorConfig:
         return self.dram_energy_per_bit * 8 * 1e-12
 
     @property
+    def vector_memory_bytes_per_cycle(self) -> int:
+        """Bytes per cycle on the matched accelerator port and SRAM bank."""
+        if type(self.bank_width) is not int or self.bank_width <= 0:
+            raise ValueError("Vector timing needs a positive bank_width in bytes")
+        return self.bank_width
+
+    @property
     def bytes_per_cycle(self) -> float:
+        """Configured DRAM bytes per cycle, before the untimed override."""
         return self.dram_bandwidth / self.frequency
 
     @property
