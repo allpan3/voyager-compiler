@@ -432,4 +432,6 @@ message MemoryConfig {
   optional uint64 bank_width = 4;         // bytes per bank word
   optional uint64 scratchpad_offset = 5;  // reserved bytes at the base
   optional double frequency_ghz = 6;
+  // Per-port idle cycles after a bank change. Zero adds no idle cycles.
+  optional uint32 bank_switch_cycles = 10;
 }

@@ -72,6 +72,8 @@ KERNEL_LAUNCH_OVERHEAD = 96
 # the fabric holds a request to a new bank until every outstanding response
 # from the previous one has returned -- one round trip, measured 8 cycles on
 # the Sphinx SoC (requests resume once the in-flight beats drain).
+# Sphinx SoC read-path measurement: buffers, crossbar, registered SRAM.
+# Check this value for other SoC builds. A build-parameter table is planned.
 BANK_SWITCH_CYCLES = 8
 
 
