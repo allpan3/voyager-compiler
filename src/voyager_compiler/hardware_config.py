@@ -103,7 +103,7 @@ class AcceleratorConfig:
     cim_c_port_tiles: Optional[int] = None
     cim_c_beat_layout: int = 1
     cim_array_result_slots: Optional[int] = None
-    cim_local_accum_contexts: int = 4
+    cim_local_accum_contexts: int = 5
 
     # Standalone interface timing for either matrix backend. Bank geometry
     # still determines tensor placement; independent ports do not arbitrate
