@@ -992,6 +992,7 @@ def _prepare_search(node, tiler, constraint=None):
         weight_transposed=transposed,
         input_buffer_size=tiler.config.input_buffer_size,
         independent_memory_ports=tiler.config.independent_memory_ports,
+        dram_untimed=tiler.config.dram_untimed,
         **backend_args,
     )
 

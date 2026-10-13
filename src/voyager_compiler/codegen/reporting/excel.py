@@ -270,7 +270,7 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
     ]
     agg = dict(agg)  # popped below; the caller's copy is reused elsewhere
     per_kernel = {r.kernel: (r.read_bytes, r.write_bytes) for r in rows}
-    bpc = result.cost.dram_bandwidth / result.cost.frequency
+    bpc = result.cost.dram_bytes_per_cycle
     lines = []  # (first start, row) -- sorted into execution order below
 
     for op in result.ops:
@@ -451,7 +451,7 @@ def operation_rows(result, rows, agg, calibration=None) -> List[OperationRow]:
         calibration: Supplies each group's measured power, if any.
     """
     stats = _per_kernel(result, agg)
-    bpc = result.cost.dram_bandwidth / result.cost.frequency
+    bpc = result.cost.dram_bytes_per_cycle
     groups: Dict[str, OperationRow] = {}
     order: List[str] = []
 
@@ -749,6 +749,7 @@ def _architecture(wb, result: ScheduleResult):
         ("double_buffered_l2", bool(cost.double_buffered_l2)),
         ("num_slots", int(cost.num_slots)),
         ("-- L3 DRAM --", ""),
+        ("dram_untimed", cost.dram_untimed),
         ("dram_size_gb", maybe(cost.dram_size, float)),
         ("dram_bandwidth_gbs", maybe(cost.dram_bandwidth, float)),
         ("dram_access_latency_ns", maybe(cost.dram_access_latency, float)),
