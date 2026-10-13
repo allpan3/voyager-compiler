@@ -68,7 +68,6 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
     _passed_whole,
 )
-from voyager_compiler.codegen.transform.tiling.cost import BANK_SWITCH_CYCLES
 from voyager_compiler.codegen.voyager_ir_pb2 import (
     MEMORY_LEVEL_DRAM,
     MEMORY_LEVEL_IMMEDIATE,
@@ -1257,7 +1256,9 @@ def gen_memory_config(config) -> MemoryConfig:
         raise ValueError("Invalid DRAM timing or compiler frequency")
     untimed = math.isinf(bandwidth) and latency == 0
     return MemoryConfig(
-        bank_switch_cycles=BANK_SWITCH_CYCLES if banked else 0,
+        bank_switch_cycles=(
+            config.timing.soc["bank_switch_cycles"] if banked else 0
+        ),
         dram_mode=MemoryConfig.UNTIMED if untimed else MemoryConfig.TIMED,
         dram_bytes_per_cycle=bandwidth,
         dram_access_latency_cycles=latency,

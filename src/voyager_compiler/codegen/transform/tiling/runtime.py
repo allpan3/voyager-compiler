@@ -5,7 +5,6 @@ from typing import Optional, Tuple
 
 import interstellar
 from voyager_compiler.codegen.transform.tiling.cost import (
-    BANK_SWITCH_CYCLES,
     _step_classes,
     _sweep_cycles,
     strided_bank_walk,
@@ -125,9 +124,12 @@ class BaseRuntimeCalculator:
         independent_memory_ports: bool = False,
         dram_untimed: bool = False,
         oc_port_width: Optional[int] = None,
+        *,
+        timing,
     ):
         if type(independent_memory_ports) is not bool:
             raise ValueError("independent_memory_ports must be a boolean")
+        self.timing_profile = timing
         self.input_dtype_width = input_dtype_width
         self.weight_dtype_width = weight_dtype_width
         self.output_dtype_width = output_dtype_width
@@ -427,7 +429,7 @@ class BaseRuntimeCalculator:
                 width * 8 / min(self.sram_bandwidth, self.oc_port_width)
             )
             result[("fused", i)] = switches * max(
-                1, BANK_SWITCH_CYCLES + 1 - beats
+                1, self.timing_profile.soc["bank_switch_cycles"] + 1 - beats
             )
         return result
 

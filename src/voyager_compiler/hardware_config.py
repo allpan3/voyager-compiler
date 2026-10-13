@@ -15,7 +15,10 @@ directly as its cost knobs.
 """
 
 from dataclasses import dataclass, fields
+from dataclasses import field as dataclass_field
 from typing import Optional, Tuple
+
+from voyager_compiler.timing_profile import TimingProfile
 
 DEFAULT_PE_ARRAY_SIZE = (32, 32)
 DEFAULT_FREQUENCY_GHZ = 1.0
@@ -55,6 +58,20 @@ class AcceleratorConfig:
     accumulation capacity; graph lowering uses the shared vector engine and
     NHWC/HWIO/CK operand layouts.
     """
+
+    # No implicit profile. Reference comparisons must select it explicitly.
+    timing_profile: Optional[str] = dataclass_field(default=None, kw_only=True)
+    # Include the loaded contents in config equality and search cache keys.
+    _timing: Optional[TimingProfile] = dataclass_field(
+        default=None, init=False, repr=False
+    )
+
+    @property
+    def timing(self) -> TimingProfile:
+        if self._timing is None:
+            # Report the same missing-record error as direct file loading.
+            return TimingProfile.load(None)
+        return self._timing
 
     # Compute
     pe_array_size: Tuple[int, int] = DEFAULT_PE_ARRAY_SIZE
@@ -139,6 +156,9 @@ class AcceleratorConfig:
             raise ValueError("matrix_backend must be 0 (systolic) or 1 (CIM)")
         if self.matrix_backend == 1:
             self._validate_cim()
+        if self.timing_profile is not None:
+            profile = TimingProfile.load(self.timing_profile)
+            object.__setattr__(self, "_timing", profile)
         if self.scratchpad_offset < 0:
             raise ValueError(
                 f"scratchpad_offset {self.scratchpad_offset} is negative"
@@ -354,6 +374,7 @@ class AcceleratorConfig:
     def from_args(cls, args) -> "AcceleratorConfig":
         """Build the config from parsed CLI args (``add_compile_args``)."""
         return cls(
+            timing_profile=args.timing_profile,
             pe_array_size=args.pe_array_size,
             vector_unit_width=args.vector_unit_width,
             matrix_vector_unit_width=args.matrix_vector_unit_width,

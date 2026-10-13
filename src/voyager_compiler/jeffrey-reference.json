@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "name": "jeffrey-reference",
+  "accelerator": {
+    "kernel_launch_overhead_cycles": 96,
+    "sa_output_slack_cycles": 24,
+    "spmm_row_cycles": 8,
+    "cim": {
+      "output_cycles_per_vector": 1,
+      "accumulation_feedback_cycles": null,
+      "weight_release_cycles": 1,
+      "weight_ready_cycles": 1,
+      "output_bank_drain_cycles": 0,
+      "output_pipeline": null
+    }
+  },
+  "soc": {
+    "name": "sphinx",
+    "bank_switch_cycles": 8,
+    "memory_request_latency_cycles": 0
+  },
+  "evidence": {
+    "accelerator.kernel_launch_overhead_cycles": {
+      "status": "reference",
+      "source": "Jeffrey Yu, compiler 2c1c1be: 96 cycles per vector pass measured on Sphinx. Reused as a reference assumption for other hardware."
+    },
+    "accelerator.sa_output_slack_cycles": {
+      "status": "reference",
+      "source": "Jeffrey Yu, compiler 7df1cd8: measured range 20\u201340 on E4M3x16x16. Preserve the original subtraction of 24 from a cycle difference."
+    },
+    "accelerator.spmm_row_cycles": {
+      "status": "reference",
+      "source": "Jeffrey Yu, compiler 2f0ae93: 7.3\u20137.5 cycles per row on Sphinx, rounded to 8."
+    },
+    "soc.bank_switch_cycles": {
+      "status": "measured",
+      "source": "Jeffrey Yu, compiler ebbb003: 8-cycle Sphinx read round trip. This describes the Sphinx fabric model, not accelerator HLS."
+    },
+    "soc.memory_request_latency_cycles": {
+      "status": "assumed",
+      "source": "Compiler a9fa461: no extra per-request initiation cost. This is not SRAM response latency."
+    },
+    "accelerator.cim.output_cycles_per_vector": {
+      "status": "assumed",
+      "source": "Compiler a9fa461: one-cycle minimum service. Payload beat count and resource costs still apply."
+    },
+    "accelerator.cim.accumulation_feedback_cycles": {
+      "status": "unknown",
+      "source": "No proven stall-safe feedback bound. Null preserves the existing unvalidated safety result; it does not assert zero latency."
+    },
+    "accelerator.cim.weight_release_cycles": {
+      "status": "derived",
+      "source": "Compiler a9fa461 and CIMProcessor::set_scoreboard: one registered release transition. Extra HLS stages remain unmeasured."
+    },
+    "accelerator.cim.weight_ready_cycles": {
+      "status": "derived",
+      "source": "Compiler a9fa461 and CIMProcessor::set_scoreboard: one registered ready transition. Extra HLS stages remain unmeasured."
+    },
+    "accelerator.cim.output_bank_drain_cycles": {
+      "status": "assumed",
+      "source": "Reference-only ideal model before the K128 correction. Zero omits bank drain; do not use this record to target hardware."
+    },
+    "accelerator.cim.output_pipeline": {
+      "status": "unknown",
+      "source": "No complete fused output pipeline record. Null retains architectural output storage with no added scheduled stages."
+    }
+  },
+  "metadata": {
+    "purpose": "reference",
+    "matrix_operand_widths": [],
+    "builds": []
+  }
+}

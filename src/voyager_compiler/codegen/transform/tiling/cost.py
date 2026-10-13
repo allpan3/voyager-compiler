@@ -61,22 +61,6 @@ OP_PASSES = {
     **dict.fromkeys(SOFTMAX_OPS, _SOFTMAX_PASSES),
 }
 
-# Cycles a pass costs the vector unit whatever it holds: params, instruction
-# issue and pipeline fill/drain.  Fixed per pass, so a tile too small to
-# amortise it is dominated by overhead.  96 on every layer_norm and softmax
-# pass the Sphinx RTL measured.
-KERNEL_LAUNCH_OVERHEAD = 96
-
-# Cycles a read stream loses each time consecutive requests move to another
-# scratchpad bank.  The SoC's read masters take their responses in order, so
-# the fabric holds a request to a new bank until every outstanding response
-# from the previous one has returned -- one round trip, measured 8 cycles on
-# the Sphinx SoC (requests resume once the in-flight beats drain).
-# Sphinx SoC read-path measurement: buffers, crossbar, registered SRAM.
-# Check this value for other SoC builds. A build-parameter table is planned.
-BANK_SWITCH_CYCLES = 8
-
-
 def get_dtype_width(dtype) -> int:
     """Element width in bits, derived from the canonical ``dtype_byte_size``
     so the dtype-name parsing lives in exactly one place."""
@@ -260,9 +244,9 @@ def pool_bank_switch_cycles(node, anchor, in_tile, config):
     window that straddles a bank boundary switches banks twice per chunk.
     ``in_tile`` is the input tile in the op's layout -- NHWC for the layout
     twin, NCHW for the aten op -- and starts on a bank, where the planner
-    puts it.  A switch costs the ``BANK_SWITCH_CYCLES`` round trip less the
-    fetch's beats after its first, which the drain overlaps: 7 on Sphinx, as
-    measured.  0 without banking."""
+    puts it.  A switch costs the recorded round trip less the fetch's beats
+    after its first. The drain overlaps those beats: 7 cycles on Sphinx,
+    as measured. The cost is 0 without banking."""
     if config.independent_memory_ports or not config.bank_size:
         return 0
     nhwc = anchor.target in NHWC_OP_VARIANTS.values()
@@ -286,7 +270,9 @@ def pool_bank_switch_cycles(node, anchor, in_tile, config):
     )
     beat = config.vector_memory_bytes_per_cycle
     fetch_beats = math.ceil(chunk * bits / 8 / beat)
-    per_switch = max(1, BANK_SWITCH_CYCLES + 1 - fetch_beats)
+    per_switch = max(
+        1, config.timing.soc["bank_switch_cycles"] + 1 - fetch_beats
+    )
     return per_switch * switches
 
 
@@ -385,8 +371,8 @@ def strided_bank_walk(loops, width, bank_size, offset=0):
 
 def gemv_bank_switch_cycles(rows, reduction, weight_bits, chunk, config):
     """Cycles a matrix-vector tile loses to scratchpad bank switches,
-    ``BANK_SWITCH_CYCLES`` each.  The unit walks one ``chunk``-element piece
-    of every row of a ``pe_array_size[0]``-row block before the next chunk,
+    at the recorded cost per switch. The unit walks one ``chunk``-element
+    piece of every row of a ``pe_array_size[0]``-row block before the next chunk,
     so when the row stride of a ``reduction``-wide tile spreads a block's
     rows over several banks, every chunk column crosses them again.  The
     tile buffer starts on a bank, where the planner puts it.  0 without
@@ -403,7 +389,7 @@ def gemv_bank_switch_cycles(rows, reduction, weight_bits, chunk, config):
                 lo = r * row_bytes + c * chunk_bytes
                 ranges.append((lo, lo + chunk_bytes))
     switches, _, _ = bank_walk(ranges, config.bank_size)
-    return BANK_SWITCH_CYCLES * switches
+    return config.timing.soc["bank_switch_cycles"] * switches
 
 
 def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
@@ -427,7 +413,7 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     fully-connected GEMM's ``(rows, reduction)`` weight tile
     (``gemv_bank_switch_cycles``), a pool's input tile
     (``pool_bank_switch_cycles``); other ops ignore it.  Given
-    ``ideal_cycles``, the per-pass ``KERNEL_LAUNCH_OVERHEAD`` and the
+    ``ideal_cycles``, the per-pass launch overhead and the
     switches are folded in so ``ideal_cycles / result`` is the tile's whole
     cost.  The single copy of the formula:
     ``reporting/cost.op_utilization`` calls it for its vector branch.
@@ -486,7 +472,11 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     util = min(1.0, 1.0 / cycles_per_group)
     if not ideal_cycles:
         return util
-    overhead = max(1, len(profile)) * KERNEL_LAUNCH_OVERHEAD + switch_cycles
+    overhead = (
+        max(1, len(profile))
+        * config.timing.accelerator["kernel_launch_overhead_cycles"]
+        + switch_cycles
+    )
     return ideal_cycles / (ideal_cycles / util + overhead)
 
 
@@ -864,7 +854,9 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
 
     def passes(count, elems):
         cycles = math.ceil(math.ceil(elems / config.vector_lanes) / util)
-        return count * (cycles + KERNEL_LAUNCH_OVERHEAD)
+        return count * (
+            cycles + config.timing.accelerator["kernel_launch_overhead_cycles"]
+        )
 
     rows, tile, out = tq, tq * tkv, tq * head_dim
     # The softmax chain: rowmax, exponentials and rowsum over the score tile

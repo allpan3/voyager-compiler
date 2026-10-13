@@ -48,15 +48,13 @@ from voyager_compiler.codegen.transform.tiling.cost import (
     get_dtype_width,
 )
 from voyager_compiler.codegen.transform.tiling.runtime import (
-    BaseRuntimeCalculator,
     _FL_DIMS,
     _IF_DIMS,
     _OF_DIMS,
+    BaseRuntimeCalculator,
     bank_partition,
 )
 from voyager_compiler.codegen.transform.tiling.sa import (
-    OUTPUT_SLACK as OUTPUT_SLACK,
-    SPMM_ROW_CYCLES as SPMM_ROW_CYCLES,
     SPMM_SCALE_ROWS,
     RuntimeCalculator,
     spmm_scale_rows,
@@ -175,6 +173,7 @@ def build_interstellar_tiler(
     ``config.independent_memory_ports`` disables shared-bank timing for either
     backend while preserving bank allocation.
     """
+    config.timing  # Require recorded inputs before search.
     backend = cim if config.matrix_backend == 1 else sa
     architecture, schedule = backend.build_architecture(config, dram_access_cost)
     return TilerContext(
@@ -955,7 +954,7 @@ def _prepare_search(node, tiler, constraint=None):
     )
 
     calculator = RuntimeCalculator
-    backend_args = {}
+    backend_args = {"timing": tiler.config.timing}
     if tiler.config.matrix_backend == 1:
         ic, oc = tiler.config.pe_array_size
         if layer.nifm % ic or layer.nofm % oc:

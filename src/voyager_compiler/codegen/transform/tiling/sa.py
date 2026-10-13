@@ -4,30 +4,16 @@ import math
 
 import interstellar
 from voyager_compiler.codegen.transform.tiling.cost import (
-    BANK_SWITCH_CYCLES,
     strided_bank_walk,
 )
 from voyager_compiler.codegen.transform.tiling.input import input_buffer_usage
 from voyager_compiler.codegen.transform.tiling.runtime import (
-    BaseRuntimeCalculator,
     _FL_DIMS,
     _IF_DIMS,
+    BaseRuntimeCalculator,
 )
 
 le = interstellar.le
-
-# Finished output vectors the matrix -> vector path holds before a
-# single-buffered accumulator's array feels the tail's drain rate: the
-# matrix processor's output FIFO (8), the vector pipeline's input FIFO (9)
-# and the stages between.  Measured on the E4M3x16x16 SoC as 20 (MobileBERT
-# GEMMs) to 40 (ResNet18) vectors; either way the error is under ~60 cycles
-# per L3 step.
-OUTPUT_SLACK = 24
-
-# Cycles the SpMM unit spends per row of each PE-array-wide pass on top of
-# the row's outliers: it drains and restarts its accumulator ring between
-# rows.  Measured on the Sphinx SoC: 7.3-7.5.
-SPMM_ROW_CYCLES = 8
 
 # Block-scale rows the SpMM unit's weight-scale buffer holds
 # (``DoubleBuffer<32>`` in ``SpMMUnit.h``, fixed in the Sphinx silicon).  A
@@ -140,8 +126,8 @@ class RuntimeCalculator(BaseRuntimeCalculator):
     scratchpad bus.  The matrix unit charges the systolic passes, each weight
     tile costing the longer of its loading and the rows streamed through it,
     plus the back-pressure of a single-buffered accumulator against
-    ``OUTPUT_SLACK`` of buffering.  The bus charges the words every operand
-    role moves, summed per bank group of the planner's partition with the
+    the recorded output slack. The bus charges the words each operand role
+    moves, summed per bank group of the planner's partition with the
     busiest bank setting the pace: input and weight rows in whole beats,
     packed as the toolchain packs them, with the read interface's lost cycle
     whenever an aligned request follows an unaligned one; block scales one
@@ -226,7 +212,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
 
     def _bank_switch_cycles(self, mapping):
         """Cycles one L3 step's input and weight streams lose to bank
-        switches, per role (``BANK_SWITCH_CYCLES`` each).
+        switches, per role (the recorded bank-switch cost each).
 
         Follow the mapping's L1 input order (_input_bank_walk) and the
         weight FY/FX/IC/OC scan. Packing combines adjacent channel groups
@@ -276,9 +262,9 @@ class RuntimeCalculator(BaseRuntimeCalculator):
                 if orders[loop][2] < orders[le.OC][2]
             )
         return {
-            "input": BANK_SWITCH_CYCLES
+            "input": self.timing_profile.soc["bank_switch_cycles"]
             * self._stream_switches(mapping, input_loops, input_walk),
-            "weight": BANK_SWITCH_CYCLES
+            "weight": self.timing_profile.soc["bank_switch_cycles"]
             * self._stream_switches(mapping, (le.OC, le.IC), weight_walk, held),
         }
 
@@ -383,8 +369,8 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         every-round buffers (``_tail_stall``) -- and, for an outlier GEMM,
         the SpMM unit, which must deliver the block's sparse correction
         before the vector pipeline releases any of its rows: per 64-column
-        pass it walks every row of the block, paying ``SPMM_ROW_CYCLES`` of
-        turnaround plus that row's outliers, each gather a bank switch when
+        pass it walks every row of the block, paying the recorded row
+        overhead plus that row's outliers, each gather a bank switch when
         the weight tile spans several banks -- plus the once-per-sweep
         overhead (buffer fill, systolic skew, the last parked tile's drain)
         spread over the ops a double-buffered L2 overlaps it with.  Also
@@ -457,8 +443,8 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         # tile -- as one burst of the whole tile when the OC passes are
         # adjacent (no filter loops at L1), else as OC1 bursts of one spatial
         # tile -- and the tail drains them at ``vector_beats`` apiece.  The
-        # path absorbs ``OUTPUT_SLACK`` of them; past that the array runs at
-        # the tail's pace for the rest of the burst.  A double-buffered
+        # path absorbs the recorded output slack. Beyond that, the array
+        # runs at the tail's pace for the rest of the burst. A double-buffered
         # accumulator parks a tile whose tail moves more than a bus word per
         # vector on some port (the toolchain's ``should_use_direct_path``);
         # a narrower tail rides the pass and pays like a single-buffered one.
@@ -477,7 +463,10 @@ class RuntimeCalculator(BaseRuntimeCalculator):
                 burst_cycles *= bursts
                 bursts = 1
             computation_l1_time += bursts * max(
-                0, burst_vectors * vector_beats - burst_cycles - OUTPUT_SLACK
+                0,
+                burst_vectors * vector_beats
+                - burst_cycles
+                - self.timing_profile.accelerator["sa_output_slack_cycles"],
             )
 
         # --- L2: outer spatial-tile loop ---
@@ -583,8 +572,12 @@ class RuntimeCalculator(BaseRuntimeCalculator):
                     / 8
                 )
                 banks = max(1, math.ceil(weight_tile_bytes / self.bank_size))
-                switch = BANK_SWITCH_CYCLES * (1 - 1 / banks)
-            spmm_block_time = visits * SPMM_ROW_CYCLES + gathers * (1 + switch)
+                switch = self.timing_profile.soc["bank_switch_cycles"] * (
+                    1 - 1 / banks
+                )
+            spmm_block_time = visits * self.timing_profile.accelerator[
+                "spmm_row_cycles"
+            ] + gathers * (1 + switch)
             block_time = max(block_time, spmm_block_time)
 
         # The first tile's loads overlap nothing; the last parked tile's drain
