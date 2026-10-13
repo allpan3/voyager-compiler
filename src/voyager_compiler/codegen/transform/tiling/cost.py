@@ -551,12 +551,12 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     else:
         tile_ops = max(_tile_elems(out_shape), in_elems)
     lanes = config.vector_lanes
-    bpc = config.bytes_per_cycle
+    bpc = config.dram_bytes_per_cycle
     ideal = math.ceil(tile_ops / lanes)
     util = vector_op_utilization(node, config, ideal, tile)
     compute = math.ceil(ideal / util)
 
-    lat = config.access_latency_cycles
+    lat = config.dram_access_latency_cycles
     # ``_sweep_cycles`` reads the store off the front.  An operand's dims
     # right-align onto the output's, the way the tile shapes were built
     # (``compute_tiled_shape``).  A reduction to one value stores it once.
@@ -877,8 +877,8 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
         interior = scores + max(context, softmax) + rescale
         boundary_step = scores + max(context, softmax + boundary)
 
-    lat = config.access_latency_cycles
-    bpc = config.bytes_per_cycle
+    lat = config.dram_access_latency_cycles
+    bpc = config.dram_bytes_per_cycle
     # ``_sweep_cycles`` reads the store off the front.
     out_bytes = _operand_bytes(tiles[node], node)
     dmas = [(_transfer_cost(tiles[node], out_bytes, lat, bpc), boundaries)]
@@ -969,8 +969,8 @@ def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     # search's ``(X, C, K)`` order, so its last two swap.
     grid = batch + (n_x, n_k, n_c)
 
-    lat = config.access_latency_cycles
-    bpc = config.bytes_per_cycle
+    lat = config.dram_access_latency_cycles
+    bpc = config.dram_bytes_per_cycle
     roles = operand_roles(node)
 
     # The output is diced by every grid dim but the reduction, which it
