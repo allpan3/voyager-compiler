@@ -993,6 +993,7 @@ def _prepare_search(node, tiler, constraint=None):
         input_buffer_size=tiler.config.input_buffer_size,
         independent_memory_ports=tiler.config.independent_memory_ports,
         dram_untimed=tiler.config.dram_untimed,
+        oc_port_width=tiler.config.oc_port_width,
         **backend_args,
     )
 
@@ -1014,7 +1015,7 @@ def _prepare_search(node, tiler, constraint=None):
         weight_batch=batch // weight_repeat,
         outlier_pct=outlier_pct,
         out_outlier_pct=out_outlier_pct,
-        bank_width=tiler.config.bank_width,
+        bank_width=tiler.config.store_word_bytes,
         vector_lanes=tiler.config.vector_lanes,
     )
     return key, _Search(anchor.name, tiler, layer, rc, size_fn)

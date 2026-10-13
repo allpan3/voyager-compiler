@@ -746,6 +746,7 @@ def _architecture(wb, result: ScheduleResult):
         ("usable_banks", maybe(cost.usable_banks, int)),
         ("bank_size", maybe(cost.bank_size, int)),
         ("bank_width", maybe(cost.bank_width, int)),
+        ("oc_port_width_bits", maybe(cost.oc_port_width, int)),
         ("double_buffered_l2", bool(cost.double_buffered_l2)),
         ("num_slots", int(cost.num_slots)),
         ("-- L3 DRAM --", ""),

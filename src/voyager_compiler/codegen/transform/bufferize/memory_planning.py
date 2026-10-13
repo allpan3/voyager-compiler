@@ -149,7 +149,7 @@ def _store_lanes(node, config) -> Optional[int]:
 def _slot_stride(node, config) -> int:
     """Byte distance between adjacent slots of a pipelined buffer: the allocated
     size of *one* slot's payload -- its bytes plus the store path's tail-beat
-    slack, aligned to ``config.bank_width`` (``tensor_alloc_bytes``).  The
+    slack, aligned to ``config.store_word_bytes`` (``tensor_alloc_bytes``).  The
     slot dimension leads the tensor, so the payload is the remaining
     ``numel // slots`` elements."""
     t = _val(node)
@@ -157,7 +157,7 @@ def _slot_stride(node, config) -> int:
     return tensor_alloc_bytes(
         t.numel() // _slots(node),
         dtype,
-        config.bank_width,
+        config.store_word_bytes,
         _store_lanes(node, config),
     )
 
@@ -165,7 +165,7 @@ def _slot_stride(node, config) -> int:
 def _nbytes(node, config) -> int:
     """Byte size of a node's tensor, using the logical (quantized) dtype when
     set: the payload plus, for a Scratchpad tensor, the store path's tail-beat
-    slack, aligned to ``config.bank_width`` (``tensor_alloc_bytes``).  A
+    slack, aligned to ``config.store_word_bytes`` (``tensor_alloc_bytes``).  A
     pipelined buffer is ``slots`` such payloads, so each slot starts on an
     aligned boundary."""
     t = _val(node)
@@ -175,7 +175,7 @@ def _nbytes(node, config) -> int:
         return _slots(node) * _slot_stride(node, config)
     dtype = node.meta.get("dtype") or t.dtype
     return tensor_alloc_bytes(
-        t.numel(), dtype, config.bank_width, _store_lanes(node, config)
+        t.numel(), dtype, config.store_word_bytes, _store_lanes(node, config)
     )
 
 

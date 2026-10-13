@@ -873,7 +873,8 @@ def tensor_alloc_bytes(numel, dtype, bank_width, vector_lanes=None):
     Args:
         numel: Element count of the tensor (or of one bank of a banked one).
         dtype: Its logical dtype (``meta['dtype']`` when quantized).
-        bank_width: Allocation alignment and store-word width, bytes;
+        bank_width: Allocation alignment and store-word width, bytes.
+            Pass ``config.store_word_bytes``; this can differ from bank width.
             ``None`` disables the alignment and the tail slack.
         vector_lanes: Store-beat width, elements; ``None`` charges the
             payload alone (a DRAM tensor, written byte-exact by the DMA).

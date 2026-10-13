@@ -124,6 +124,7 @@ class BaseRuntimeCalculator:
         input_buffer_size: Optional[int] = None,
         independent_memory_ports: bool = False,
         dram_untimed: bool = False,
+        oc_port_width: Optional[int] = None,
     ):
         if type(independent_memory_ports) is not bool:
             raise ValueError("independent_memory_ports must be a boolean")
@@ -133,6 +134,8 @@ class BaseRuntimeCalculator:
         self.accum_dtype_width = accum_dtype_width
         self.double_buffered_accum_buffer = double_buffered_accum_buffer
         self.sram_bandwidth = sram_bandwidth
+        # Older direct callers assume equal accelerator and bank widths.
+        self.oc_port_width = oc_port_width or sram_bandwidth
         self.dram_untimed = dram_untimed
         self.dram_bandwidth = dram_bandwidth
         self.dram_access_latency_cycles = dram_access_latency_cycles
@@ -188,7 +191,9 @@ class BaseRuntimeCalculator:
         loose = [count for role, count in words.items() if role not in placed]
         return max([busiest, *loose])
 
-    def _request_words(self, requests, row_elems, bits, loop_bound, pitch):
+    def _request_words(
+        self, requests, row_elems, bits, loop_bound, pitch, bandwidth=None
+    ):
         """Bus words ``requests`` fetches of one ``row_elems``-element row
         take.  A request is served in whole beats, so a row that is not a
         multiple of the port costs more than its bytes.  The controller packs
@@ -201,17 +206,17 @@ class BaseRuntimeCalculator:
         holds the next request's first beat when that one starts on a beat
         boundary, so a pitch that is not a multiple of the beat cycles the
         requests through the beat offsets and costs one cycle per aligned
-        request that follows an unaligned one."""
+        request that follows an unaligned one. ``bandwidth`` is in bits per
+        cycle and defaults to the bank width."""
         if not bits or requests <= 0:
             return 0
+        bandwidth = bandwidth or self.sram_bandwidth
         row_bits = row_elems * bits
-        pf = math.lcm(row_bits, self.sram_bandwidth) // row_bits
+        pf = math.lcm(row_bits, bandwidth) // row_bits
         rows_per_request = pf if loop_bound and loop_bound % pf == 0 else 1
-        request_words = math.ceil(
-            rows_per_request * row_bits / self.sram_bandwidth
-        )
+        request_words = math.ceil(rows_per_request * row_bits / bandwidth)
         count = math.ceil(requests / rows_per_request)
-        beat = self.sram_bandwidth // 8
+        beat = bandwidth // 8
         misalignment = rows_per_request * pitch % beat
         flushes = 0
         if misalignment:
@@ -236,7 +241,7 @@ class BaseRuntimeCalculator:
             extent *= blocking
         return extent
 
-    def _tail_words(self, mapping, level):
+    def _tail_words(self, mapping, level, bandwidth=None):
         """Bus words the tail's operands take for one tile at ``level`` (1 =
         an L1 output tile, 2 = the whole L3 output tile), per role: the
         finished output with its block scales -- each scale leaves in a bus
@@ -245,10 +250,14 @@ class BaseRuntimeCalculator:
         rides on the array's output one vector (a row of ``oc_dim`` values)
         at a time and fetches a fused operand in one unpacked request per
         vector, so an operand narrower than a bus word still costs a word
-        per vector."""
+        per vector. ``bandwidth`` is in bits per cycle and defaults to the
+        bank width."""
+        bandwidth = bandwidth or self.sram_bandwidth
         ext = lambda loop: self._extent(mapping, loop, level)
         out = ext(le.OC) * ext(le.OY) * ext(le.OX) * ext(le.ON)
-        words = {"output": self._bus_words(out, self.output_dtype_width)}
+        words = {
+            "output": self._bus_words(out, self.output_dtype_width, bandwidth / 8)
+        }
         if self.output_scale_width:
             words["output"] += math.ceil(out / self.scale_block_size)
         oc_dim = mapping.loop_partitionings[le.OC][0]
@@ -258,11 +267,11 @@ class BaseRuntimeCalculator:
                 rows = math.prod(ext(dim) for dim in dims if dim != le.OC)
                 vectors = rows * math.ceil(ext(le.OC) / oc_dim)
                 words[("fused", i)] = self._request_words(
-                    vectors, oc_dim, bits, 0, math.ceil(oc2 * bits / 8)
+                    vectors, oc_dim, bits, 0, math.ceil(oc2 * bits / 8), bandwidth
                 )
             else:
                 words[("fused", i)] = self._bus_words(
-                    math.prod(ext(dim) for dim in dims), bits
+                    math.prod(ext(dim) for dim in dims), bits, bandwidth / 8
                 )
         return words
 
@@ -414,7 +423,9 @@ class BaseRuntimeCalculator:
                     for d in dims_out
                 )
                 switches = strided_bank_walk(loops, width, self.bank_size)[0]
-            beats = math.ceil(width * 8 / self.sram_bandwidth)
+            beats = math.ceil(
+                width * 8 / min(self.sram_bandwidth, self.oc_port_width)
+            )
             result[("fused", i)] = switches * max(
                 1, BANK_SWITCH_CYCLES + 1 - beats
             )
@@ -426,9 +437,8 @@ class BaseRuntimeCalculator:
 
         The busier of the unit's own rate -- one lane group per cycle, sized
         by the widest element the tail touches (the partial sum it reads, not
-        the narrower value a ``quantize_mx`` writes) at ``dram_bandwidth``,
-        which is what ``vector_op_utilization`` charges for the same tail in
-        the reporting model -- and the busiest bank: the accumulator read
+        the narrower value a ``quantize_mx`` writes) at ``oc_port_width`` --
+        and the busiest bank: the accumulator read
         back, the finished tile and its scales written, each tail operand
         read, summed wherever the partition puts them together.
         """
@@ -440,8 +450,13 @@ class BaseRuntimeCalculator:
         widths = [self.output_dtype_width, self.accum_dtype_width]
         widths += [bits for _, bits in self.tail_specs]
         lane_bytes = max(widths) / 8 * oc_dim
-        lanes = output_size * math.ceil(lane_bytes / self.dram_bandwidth)
-        words = self._tail_words(mapping, 2)
+        lanes = output_size * math.ceil(lane_bytes * 8 / self.oc_port_width)
+        bandwidth = (
+            self.oc_port_width
+            if self.independent_memory_ports
+            else self.sram_bandwidth
+        )
+        words = self._tail_words(mapping, 2, bandwidth)
         for role, cycles in self._tail_bank_switch_cycles(
             mapping, tiled=False
         ).items():
@@ -450,12 +465,12 @@ class BaseRuntimeCalculator:
             self.single_k_tail_extra_pass and not self.tail_keeps_shape
         ):
             words["scratch"] = self._bus_words(
-                output_size * oc_dim, self.accum_dtype_width
+                output_size * oc_dim, self.accum_dtype_width, bandwidth / 8
             )
         elif self.single_k_tail_extra_pass:
             # The in-place pass reads the finished tile from its output slot.
             words["output"] += self._bus_words(
-                output_size * oc_dim, self.output_dtype_width
+                output_size * oc_dim, self.output_dtype_width, bandwidth / 8
             )
         return max(lanes, self._bank_cycles(words, bank_groups))
 

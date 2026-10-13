@@ -111,6 +111,8 @@ class AcceleratorConfig:
     # still determines tensor placement; independent ports do not arbitrate
     # accesses by bank address or pay the SoC bank-switch round trip.
     independent_memory_ports: bool = False
+    # Accelerator output-side memory port, in bits. This is not a lane count.
+    oc_port_width: Optional[int] = None
 
     def __post_init__(self):
         """Reject a reservation the rest of the compiler could not honour.
@@ -120,6 +122,12 @@ class AcceleratorConfig:
 
         Also validate the selected matrix backend and its CIM configuration.
         """
+        if self.oc_port_width is not None and (
+            type(self.oc_port_width) is not int
+            or self.oc_port_width <= 0
+            or self.oc_port_width % 8
+        ):
+            raise ValueError("oc_port_width must be a positive multiple of 8 bits")
         if type(self.dram_untimed) is not bool:
             raise ValueError("dram_untimed must be a boolean")
         if type(self.independent_memory_ports) is not bool:
@@ -265,7 +273,39 @@ class AcceleratorConfig:
         return self.dram_energy_per_bit * 8 * 1e-12
 
     @property
+    def store_word_bytes(self) -> Optional[int]:
+        """Full output word reserved by allocation, including unused bytes."""
+        if self.oc_port_width is not None:
+            return self.oc_port_width // 8
+        return self.bank_width
+
+    @property
+    def oc_port_bytes(self) -> int:
+        """Bytes per accelerator port beat, independent of DRAM timing.
+
+        Older callers specify only bank_width and assume equal port and bank
+        widths. Explicit oc_port_width supports different widths.
+        """
+        width = self.store_word_bytes
+        if type(width) is int and width > 0:
+            return width
+        raise ValueError("Vector timing needs oc_port_width or bank_width")
+
+    @property
+    def vector_memory_bytes_per_cycle(self) -> int:
+        """Uncontended read rate, limited by the port and a bank word.
+
+        Independent ports omit bank service and keep the physical port limit.
+        """
+        port = self.oc_port_bytes
+        banked = not self.independent_memory_ports and all(
+            (self.scratchpad_size, self.num_banks, self.bank_width)
+        )
+        return min(port, self.bank_width) if banked else port
+
+    @property
     def bytes_per_cycle(self) -> float:
+        """Configured DRAM bytes per cycle, before the untimed override."""
         return self.dram_bandwidth / self.frequency
 
     @property
@@ -327,6 +367,7 @@ class AcceleratorConfig:
             scratchpad_offset=args.scratchpad_offset,
             num_banks=args.num_banks,
             bank_width=args.bank_width,
+            oc_port_width=args.oc_port_width,
             double_buffered_l2=args.double_buffered_l2,
             independent_memory_ports=args.independent_memory_ports,
             dram_untimed=args.dram_untimed,

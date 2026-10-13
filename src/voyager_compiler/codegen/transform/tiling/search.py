@@ -183,14 +183,14 @@ def _tensor_bytes(node, shape, config):
     if isinstance(val, torch.Tensor):
         dtype = node.meta.get("dtype") or val.dtype
         return tensor_alloc_bytes(
-            math.prod(shape), dtype, config.bank_width, lanes
+            math.prod(shape), dtype, config.store_word_bytes, lanes
         )
 
     if isinstance(val, (tuple, list)):
         numel = [math.prod(s) for s in shape]
         dtypes = node.meta.get("dtype") or [None for _ in val]
         sizes = [
-            tensor_alloc_bytes(n, dt or t.dtype, config.bank_width, lanes)
+            tensor_alloc_bytes(n, dt or t.dtype, config.store_word_bytes, lanes)
             for t, n, dt in zip(val, numel, dtypes)
         ]
         return sum(sizes)
@@ -275,7 +275,7 @@ def _staged_scratch_bytes(node, tiled_shapes, config) -> int:
     return tensor_alloc_bytes(
         math.prod(out_tile),
         anchor.value.dtype,
-        config.bank_width,
+        config.store_word_bytes,
         config.vector_lanes,
     )
 
@@ -316,7 +316,7 @@ def _bank_groups(node, tiled_shapes, config, extra_sharing):
     # taking one apiece.
     reserved = sum(
         tensor_alloc_bytes(
-            math.prod(shape), dtype, config.bank_width, config.vector_lanes
+            math.prod(shape), dtype, config.store_word_bytes, config.vector_lanes
         )
         for _, shape, dtype in reduction_scratch(
             node, tiled_shapes[node], config.vector_lanes
@@ -328,7 +328,7 @@ def _bank_groups(node, tiled_shapes, config, extra_sharing):
     anchor = get_anchor_node(node)
     if anchor is not None and is_full_reduction(anchor):
         reserved += tensor_alloc_bytes(
-            1, anchor.value.dtype, config.bank_width, config.vector_lanes
+            1, anchor.value.dtype, config.store_word_bytes, config.vector_lanes
         )
     if reserved:
         sized.append((reserved, [BANK_GROUP_RESERVED]))
@@ -979,7 +979,8 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config, bool_mask):
 
     def acc_bytes(shape):
         return tensor_alloc_bytes(
-            math.prod(shape), acc_dtype, config.bank_width, config.vector_lanes
+            math.prod(shape), acc_dtype, config.store_word_bytes,
+            config.vector_lanes
         )
 
     # m, row_tmp, alpha and the two slots of l; o, pv_buf; the
@@ -1000,7 +1001,7 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config, bool_mask):
         total += 2 * tensor_alloc_bytes(
             tq * tkv,
             torch.bool if bool_mask else acc_dtype,
-            config.bank_width,
+            config.store_word_bytes,
             config.vector_lanes,
         )
     if residual is not None:

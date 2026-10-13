@@ -297,6 +297,13 @@ def add_compile_args(parser=None):
         help="Memory bank width (bytes) for memory planning.",
     )
     parser.add_argument(
+        "--oc_port_width",
+        type=int,
+        default=None,
+        help="Accelerator output-side memory port width in bits, including "
+        "vector reads and writes. Defaults to bank_width * 8 when omitted.",
+    )
+    parser.add_argument(
         "--independent_memory_ports",
         action=argparse.BooleanOptionalAction,
         default=False,

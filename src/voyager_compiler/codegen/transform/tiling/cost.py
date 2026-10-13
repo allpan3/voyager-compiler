@@ -126,7 +126,7 @@ def _node_dtype_bits(node, default: Optional[int] = None):
     return get_dtype_width(value.dtype)
 
 
-def _record_writes(record_bits: int, beat: int) -> float:
+def _record_writes(record_bits: int, beat: int, bank_beat=None) -> float:
     """Write cycles per record of ``record_bits`` on a ``beat``-byte bus,
     averaged over the alignment cycle: one per beat-sized word, two where
     the record starts mid-beat and the bus splits the word."""
@@ -134,7 +134,18 @@ def _record_writes(record_bits: int, beat: int) -> float:
     words = math.ceil(nbytes / beat)
     period = math.lcm(nbytes, beat) // nbytes
     split = sum(1 for g in range(period) if (g * nbytes) % beat)
-    return words * (period + split) / period
+    port_cycles = words * (period + split) / period
+    if bank_beat is None or bank_beat >= beat:
+        return port_cycles
+    # The output port writes full words, including a partial record's tail.
+    # A narrower bank serves each word in several pieces. Include alignment.
+    period = math.lcm(nbytes, beat, bank_beat) // nbytes
+    bank_cycles = sum(
+        math.ceil(((g * nbytes + word * beat) % bank_beat + beat) / bank_beat)
+        for g in range(period)
+        for word in range(words)
+    ) / period
+    return max(port_cycles, bank_cycles)
 
 
 def _input_bits(node, anchor) -> int:
@@ -151,18 +162,18 @@ def _input_bits(node, anchor) -> int:
     return max(bits) if isinstance(bits, list) else bits
 
 
-def _output_writes(node, lanes: int, beat: int) -> float:
+def _output_writes(node, lanes: int, beat: int, bank_beat=None) -> float:
     """Write cycles per lane group of ``node``'s outputs: the data output's
     record, plus one per block scale a ``quantize_mx`` tail writes beside
     it."""
     widths = _node_dtype_bits(node)
     if not isinstance(widths, list):
-        return _record_writes(lanes * widths, beat)
+        return _record_writes(lanes * widths, beat, bank_beat)
     values = getattr(node, "value", None)
     if values is None:
         values = node.meta.get("val")
     data = max(range(len(widths)), key=lambda i: values[i].numel())
-    return _record_writes(lanes * widths[data], beat) + len(widths) - 1
+    return _record_writes(lanes * widths[data], beat, bank_beat) + len(widths) - 1
 
 
 def pool_taps(anchor) -> int:
@@ -273,7 +284,7 @@ def pool_bank_switch_cycles(node, anchor, in_tile, config):
         bits,
         config.bank_size,
     )
-    beat = max(1, round(config.bytes_per_cycle))
+    beat = config.vector_memory_bytes_per_cycle
     fetch_beats = math.ceil(chunk * bits / 8 / beat)
     per_switch = max(1, BANK_SWITCH_CYCLES + 1 - fetch_beats)
     return per_switch * switches
@@ -401,11 +412,11 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     Peak is one ``config.vector_lanes``-wide lane group per cycle.  Each
     pass over the data (``OP_PASSES``; one for everything else) costs a lane
     group the greater of its read cycles, the bus beats its widest streamed
-    operand is fetched in, and its write cycles, at ``config.bytes_per_cycle``
-    per beat: a reduction pass writes one value per row, so it runs at the
-    read rate, and a record that ends mid-beat is split by the bus, so a
-    sub-byte output can take more write cycles than read cycles.  A
-    fully-connected GEMM streams its weight once per output through the
+    operand is fetched in, and its write cycles. Port width and bank service
+    limit these rates; DRAM bandwidth does not. A reduction pass writes one
+    value per row, so it runs at the read rate. A record that ends mid-beat
+    is split by the bus, so a sub-byte output can take more write cycles than
+    read cycles. A fully-connected GEMM streams its weight once per output through the
     unit ``gemv_lanes`` names, a lane group being that unit's width, and is
     sized by the buffer the kernel loads (``weight_transforms``), not by
     what a fused prologue decodes it into.  A pool fetches one lane group
@@ -423,8 +434,8 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     """
     anchor = get_anchor_node(node) or node
     lanes = config.vector_lanes
-    bytes_per_cycle = config.bytes_per_cycle
-    beat = max(1, round(bytes_per_cycle))
+    bytes_per_cycle = config.vector_memory_bytes_per_cycle
+    beat = config.oc_port_bytes
     switch_cycles = 0
     cycles_per_group = 0.0
     if is_fully_connected(anchor):
@@ -466,9 +477,11 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
         if write is None:
             write_cycles = 0.0
         elif write is MID:
-            write_cycles = _record_writes(lanes * reads[MID], beat)
+            write_cycles = _record_writes(
+                lanes * reads[MID], beat, bytes_per_cycle
+            )
         else:
-            write_cycles = _output_writes(node, lanes, beat)
+            write_cycles = _output_writes(node, lanes, beat, bytes_per_cycle)
         cycles_per_group += max(read_cycles, write_cycles)
     util = min(1.0, 1.0 / cycles_per_group)
     if not ideal_cycles:
@@ -845,7 +858,9 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
     # The vector unit's passes, at the softmax's width (the output's): one
     # lane group per cycle, bound by the beats its bytes take.
     group_bytes = config.vector_lanes * _node_dtype_bits(node) / 8
-    util = min(1.0, 1.0 / math.ceil(group_bytes / config.bytes_per_cycle))
+    util = min(
+        1.0, 1.0 / math.ceil(group_bytes / config.vector_memory_bytes_per_cycle)
+    )
 
     def passes(count, elems):
         cycles = math.ceil(math.ceil(elems / config.vector_lanes) / util)
