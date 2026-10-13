@@ -67,6 +67,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
     _passed_whole,
 )
+from voyager_compiler.codegen.transform.tiling.cost import BANK_SWITCH_CYCLES
 from voyager_compiler.codegen.voyager_ir_pb2 import (
     MEMORY_LEVEL_DRAM,
     MEMORY_LEVEL_IMMEDIATE,
@@ -1243,6 +1244,7 @@ def gen_memory_config(config) -> MemoryConfig:
         (config.scratchpad_size, config.num_banks, config.bank_width)
     )
     return MemoryConfig(
+        bank_switch_cycles=BANK_SWITCH_CYCLES if banked else 0,
         mode=MemoryConfig.BANKED if banked else MemoryConfig.INDEPENDENT,
         scratchpad_size=config.scratchpad_size or 0,
         num_banks=config.num_banks or 0,
