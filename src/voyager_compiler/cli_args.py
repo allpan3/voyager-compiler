@@ -333,6 +333,12 @@ def add_compile_args(parser=None):
         help="Use a double-buffered accumulation buffer (interstellar tiling).",
     )
     parser.add_argument(
+        "--dram_untimed",
+        action="store_true",
+        help="Disable DRAM transfer time in mapping selection and the harness. "
+        "Keep the existing compute and scratchpad cost inputs.",
+    )
+    parser.add_argument(
         "--dram_size",
         type=float,
         default=DEFAULT_DRAM_SIZE_GB,
@@ -342,7 +348,8 @@ def add_compile_args(parser=None):
         "--dram_bandwidth",
         type=float,
         default=DEFAULT_DRAM_BANDWIDTH_GBS,
-        help="Typical mobile SoC DRAM bandwidth in GB/s.",
+        help="DRAM bandwidth in GB/s. Use --dram_untimed to disable transfer "
+        "time without changing the compute cost inputs.",
     )
     parser.add_argument(
         "--dram_access_latency",

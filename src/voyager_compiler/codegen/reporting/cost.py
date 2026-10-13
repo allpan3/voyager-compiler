@@ -91,6 +91,8 @@ def tile_bytes(buffer_node: Node, sizes) -> int:
 
 
 def dram_cycles(n_bytes: int, cost: AcceleratorConfig) -> int:
+    if cost.dram_untimed:
+        return 0
     # GB/s == bytes/ns, so n_bytes / dram_bandwidth is the transfer time in ns;
     # add the access latency (ns) and convert to cycles with frequency (GHz).
     time_ns = cost.dram_access_latency + n_bytes / cost.dram_bandwidth
