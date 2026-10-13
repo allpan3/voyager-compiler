@@ -273,7 +273,7 @@ def pool_bank_switch_cycles(node, anchor, in_tile, config):
         bits,
         config.bank_size,
     )
-    beat = max(1, round(config.bytes_per_cycle))
+    beat = config.vector_memory_bytes_per_cycle
     fetch_beats = math.ceil(chunk * bits / 8 / beat)
     per_switch = max(1, BANK_SWITCH_CYCLES + 1 - fetch_beats)
     return per_switch * switches
@@ -401,7 +401,7 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     Peak is one ``config.vector_lanes``-wide lane group per cycle.  Each
     pass over the data (``OP_PASSES``; one for everything else) costs a lane
     group the greater of its read cycles, the bus beats its widest streamed
-    operand is fetched in, and its write cycles, at ``config.bytes_per_cycle``
+    operand is fetched in, and its write cycles, at ``config.bank_width`` bytes
     per beat: a reduction pass writes one value per row, so it runs at the
     read rate, and a record that ends mid-beat is split by the bus, so a
     sub-byte output can take more write cycles than read cycles.  A
@@ -423,8 +423,8 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     """
     anchor = get_anchor_node(node) or node
     lanes = config.vector_lanes
-    bytes_per_cycle = config.bytes_per_cycle
-    beat = max(1, round(bytes_per_cycle))
+    bytes_per_cycle = config.vector_memory_bytes_per_cycle
+    beat = bytes_per_cycle
     switch_cycles = 0
     cycles_per_group = 0.0
     if is_fully_connected(anchor):
@@ -845,7 +845,9 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
     # The vector unit's passes, at the softmax's width (the output's): one
     # lane group per cycle, bound by the beats its bytes take.
     group_bytes = config.vector_lanes * _node_dtype_bits(node) / 8
-    util = min(1.0, 1.0 / math.ceil(group_bytes / config.bytes_per_cycle))
+    util = min(
+        1.0, 1.0 / math.ceil(group_bytes / config.vector_memory_bytes_per_cycle)
+    )
 
     def passes(count, elems):
         cycles = math.ceil(math.ceil(elems / config.vector_lanes) / util)
