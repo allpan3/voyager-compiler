@@ -91,6 +91,8 @@ def tile_bytes(buffer_node: Node, sizes) -> int:
 
 
 def dram_cycles(n_bytes: int, cost: AcceleratorConfig) -> int:
+    if cost.dram_untimed:
+        return 0
     # GB/s == bytes/ns, so n_bytes / dram_bandwidth is the transfer time in ns;
     # add the access latency (ns) and convert to cycles with frequency (GHz).
     time_ns = cost.dram_access_latency + n_bytes / cost.dram_bandwidth
@@ -117,7 +119,7 @@ def op_utilization(
 
     Everything else runs on the vector unit; ``vector_op_utilization`` (shared
     with the vector L2-tiling cost model) charges it, at
-    ``cost.bytes_per_cycle`` SRAM bandwidth -- including the fully-connected
+    ``cost.bank_width`` bytes per cycle -- including the fully-connected
     case, which it sizes by the streamed weight and its bank switches over
     the anchor's shape, the tile once bufferized, and a pool, whose fetch it
     walks for bank switches over the anchor's input tile.  ``ideal_cycles``

@@ -74,6 +74,8 @@ class AcceleratorConfig:
     bank_width: Optional[int] = None
     double_buffered_l2: bool = DEFAULT_DOUBLE_BUFFERED_L2
     # L3 DRAM
+    # Disable DRAM transfer time while retaining the existing compute costs.
+    dram_untimed: bool = False
     dram_size: Optional[float] = DEFAULT_DRAM_SIZE_GB
     dram_bandwidth: Optional[float] = DEFAULT_DRAM_BANDWIDTH_GBS
     dram_access_latency: Optional[float] = DEFAULT_DRAM_ACCESS_LATENCY_NS
@@ -118,6 +120,8 @@ class AcceleratorConfig:
 
         Also validate the selected matrix backend and its CIM configuration.
         """
+        if type(self.dram_untimed) is not bool:
+            raise ValueError("dram_untimed must be a boolean")
         if type(self.independent_memory_ports) is not bool:
             raise ValueError("independent_memory_ports must be a boolean")
         if type(self.matrix_backend) is not int or self.matrix_backend not in (
@@ -261,12 +265,28 @@ class AcceleratorConfig:
         return self.dram_energy_per_bit * 8 * 1e-12
 
     @property
+    def vector_memory_bytes_per_cycle(self) -> int:
+        """Bytes per cycle on the matched accelerator port and SRAM bank."""
+        if type(self.bank_width) is not int or self.bank_width <= 0:
+            raise ValueError("Vector timing needs a positive bank_width in bytes")
+        return self.bank_width
+
+    @property
     def bytes_per_cycle(self) -> float:
+        """Configured DRAM bytes per cycle, before the untimed override."""
         return self.dram_bandwidth / self.frequency
 
     @property
     def access_latency_cycles(self) -> float:
         return self.dram_access_latency * self.frequency
+
+    @property
+    def dram_bytes_per_cycle(self) -> float:
+        return float("inf") if self.dram_untimed else self.bytes_per_cycle
+
+    @property
+    def dram_access_latency_cycles(self) -> float:
+        return 0.0 if self.dram_untimed else self.access_latency_cycles
 
     @property
     def num_slots(self) -> int:
@@ -317,6 +337,7 @@ class AcceleratorConfig:
             bank_width=args.bank_width,
             double_buffered_l2=args.double_buffered_l2,
             independent_memory_ports=args.independent_memory_ports,
+            dram_untimed=args.dram_untimed,
             dram_size=args.dram_size,
             dram_bandwidth=args.dram_bandwidth,
             dram_access_latency=args.dram_access_latency,

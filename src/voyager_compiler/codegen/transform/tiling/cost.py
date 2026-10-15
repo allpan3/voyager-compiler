@@ -72,6 +72,8 @@ KERNEL_LAUNCH_OVERHEAD = 96
 # the fabric holds a request to a new bank until every outstanding response
 # from the previous one has returned -- one round trip, measured 8 cycles on
 # the Sphinx SoC (requests resume once the in-flight beats drain).
+# Sphinx SoC read-path measurement: buffers, crossbar, registered SRAM.
+# Check this value for other SoC builds. A build-parameter table is planned.
 BANK_SWITCH_CYCLES = 8
 
 
@@ -271,7 +273,7 @@ def pool_bank_switch_cycles(node, anchor, in_tile, config):
         bits,
         config.bank_size,
     )
-    beat = max(1, round(config.bytes_per_cycle))
+    beat = config.vector_memory_bytes_per_cycle
     fetch_beats = math.ceil(chunk * bits / 8 / beat)
     per_switch = max(1, BANK_SWITCH_CYCLES + 1 - fetch_beats)
     return per_switch * switches
@@ -399,7 +401,7 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     Peak is one ``config.vector_lanes``-wide lane group per cycle.  Each
     pass over the data (``OP_PASSES``; one for everything else) costs a lane
     group the greater of its read cycles, the bus beats its widest streamed
-    operand is fetched in, and its write cycles, at ``config.bytes_per_cycle``
+    operand is fetched in, and its write cycles, at ``config.bank_width`` bytes
     per beat: a reduction pass writes one value per row, so it runs at the
     read rate, and a record that ends mid-beat is split by the bus, so a
     sub-byte output can take more write cycles than read cycles.  A
@@ -421,8 +423,8 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     """
     anchor = get_anchor_node(node) or node
     lanes = config.vector_lanes
-    bytes_per_cycle = config.bytes_per_cycle
-    beat = max(1, round(bytes_per_cycle))
+    bytes_per_cycle = config.vector_memory_bytes_per_cycle
+    beat = bytes_per_cycle
     switch_cycles = 0
     cycles_per_group = 0.0
     if is_fully_connected(anchor):
@@ -549,12 +551,12 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     else:
         tile_ops = max(_tile_elems(out_shape), in_elems)
     lanes = config.vector_lanes
-    bpc = config.bytes_per_cycle
+    bpc = config.dram_bytes_per_cycle
     ideal = math.ceil(tile_ops / lanes)
     util = vector_op_utilization(node, config, ideal, tile)
     compute = math.ceil(ideal / util)
 
-    lat = config.access_latency_cycles
+    lat = config.dram_access_latency_cycles
     # ``_sweep_cycles`` reads the store off the front.  An operand's dims
     # right-align onto the output's, the way the tile shapes were built
     # (``compute_tiled_shape``).  A reduction to one value stores it once.
@@ -843,7 +845,9 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
     # The vector unit's passes, at the softmax's width (the output's): one
     # lane group per cycle, bound by the beats its bytes take.
     group_bytes = config.vector_lanes * _node_dtype_bits(node) / 8
-    util = min(1.0, 1.0 / math.ceil(group_bytes / config.bytes_per_cycle))
+    util = min(
+        1.0, 1.0 / math.ceil(group_bytes / config.vector_memory_bytes_per_cycle)
+    )
 
     def passes(count, elems):
         cycles = math.ceil(math.ceil(elems / config.vector_lanes) / util)
@@ -875,8 +879,8 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
         interior = scores + max(context, softmax) + rescale
         boundary_step = scores + max(context, softmax + boundary)
 
-    lat = config.access_latency_cycles
-    bpc = config.bytes_per_cycle
+    lat = config.dram_access_latency_cycles
+    bpc = config.dram_bytes_per_cycle
     # ``_sweep_cycles`` reads the store off the front.
     out_bytes = _operand_bytes(tiles[node], node)
     dmas = [(_transfer_cost(tiles[node], out_bytes, lat, bpc), boundaries)]
@@ -967,8 +971,8 @@ def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     # search's ``(X, C, K)`` order, so its last two swap.
     grid = batch + (n_x, n_k, n_c)
 
-    lat = config.access_latency_cycles
-    bpc = config.bytes_per_cycle
+    lat = config.dram_access_latency_cycles
+    bpc = config.dram_bytes_per_cycle
     roles = operand_roles(node)
 
     # The output is diced by every grid dim but the reduction, which it
