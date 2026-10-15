@@ -269,6 +269,11 @@ def add_compile_args(parser=None):
     if parser is None:
         parser = argparse.ArgumentParser()
 
+    parser.add_argument(
+        "--timing_profile",
+        help="Path to a recorded hardware timing JSON file.",
+    )
+
     # -- memory hierarchy ---------------------------------------------------
     parser.add_argument(
         "--scratchpad_size",

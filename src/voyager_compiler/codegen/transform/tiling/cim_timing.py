@@ -33,19 +33,17 @@ le = interstellar.le
 REDUCTIONS = ("IC", "FX", "FY")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class TimingOptions(OutputOptions):
-    """Interface timing assumptions for standalone CIM estimates."""
+    """Recorded interface timing for CIM estimates, in cycles."""
 
-    memory_request_latency: int = 0
-    output_cycles_per_vector: int = 1
-    # Zero leaves SRAM feedback safety unvalidated until an HLS latency is supplied.
-    accumulation_feedback_cycles: int = 0
-    # Release to reuse and fill to first issue each pass one registered
-    # resident-set state (set_scoreboard in CIMProcessor.h). HLS pipeline
-    # stages depend on the build and are not modelled.
-    weight_release_cycles: int = 1
-    weight_ready_cycles: int = 1
+    memory_request_latency: int
+    output_cycles_per_vector: int
+    # None leaves SRAM feedback safety unvalidated.
+    accumulation_feedback_cycles: int | None
+    weight_release_cycles: int
+    weight_ready_cycles: int
+    output_bank_drain_cycles: int
 
     def __post_init__(self):
         super().__post_init__()
@@ -61,8 +59,11 @@ class TimingOptions(OutputOptions):
             "accumulation_feedback_cycles",
             "weight_release_cycles",
             "weight_ready_cycles",
+            "output_bank_drain_cycles",
         ):
             value = getattr(self, name)
+            if name == "accumulation_feedback_cycles" and value is None:
+                continue
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
 
@@ -301,7 +302,14 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             options = replace(options, output_pipeline=None)
 
     outputs = work.output_vectors
-    total_output_cycles = outputs * output_cycles_per_vector
+    final_vectors = (
+        prod(l1[loop] for loop in ("OX", "OY", "OC")) if banked else 1
+    )
+    output_tiles = outputs // final_vectors if banked else 0
+    bank_drain = options.output_bank_drain_cycles if banked else 0
+    total_output_cycles = (
+        outputs * output_cycles_per_vector + output_tiles * bank_drain
+    )
     total_bias_cycles = (
         traffic.bias_external_beats
         + bias_requests * options.memory_request_latency
@@ -396,10 +404,9 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
         )
         resource_cycles["bias"] = max(total_bias_cycles, bias.producer_cycles)
     # Keep the last output vector or completed bank in the non-overlapped drain.
-    final_vectors = (
-        prod(l1[loop] for loop in ("OX", "OY", "OC")) if banked else 1
+    final_output = (
+        min(outputs, final_vectors) * output_cycles_per_vector + bank_drain
     )
-    final_output = min(outputs, final_vectors) * output_cycles_per_vector
     resource_cycles["output"] = max(0, total_output_cycles - final_output)
     output_bound = False
     output_readiness = {}
@@ -428,7 +435,7 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             2,
             work.mac_requests // blocks * issue_interval,
             0,
-            final_vectors * output_cycles_per_vector,
+            final_vectors * output_cycles_per_vector + bank_drain,
             0,
         )
         resource_cycles["output"] = max(
@@ -517,6 +524,8 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             accumulation_feedback_spacing_cycles=spacing,
             accumulation_feedback_safe=feedback_safe,
             output_bank_serialized_bound=output_bound,
+            output_bank_tiles=output_tiles,
+            output_bank_drain_cycles=bank_drain,
             result_latency_cycles=latency,
         ),
     )

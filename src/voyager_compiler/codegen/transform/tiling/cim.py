@@ -12,11 +12,9 @@ from math import prod
 
 import interstellar
 from voyager_compiler.codegen.transform.tiling.cim_timing import (
-    TimingOptions,
     estimate_cycles,
 )
 from voyager_compiler.codegen.transform.tiling.cost import (
-    BANK_SWITCH_CYCLES,
     strided_bank_walk,
 )
 from voyager_compiler.codegen.transform.tiling.input import input_buffer_usage
@@ -462,13 +460,15 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
     without modeling command serialization or unprofiled HLS pipeline stages.
     """
 
-    def __init__(
-        self, *args, config, layer, timing_options=TimingOptions(), **kwargs
-    ):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, config, layer, timing_options=None, **kwargs):
+        super().__init__(*args, timing=config.timing, **kwargs)
         self.config = config
         self.layer = layer
-        self.timing_options = timing_options
+        self.timing_options = (
+            config.timing.cim_options()
+            if timing_options is None
+            else timing_options
+        )
         self._input_cache = {}
         # The bank partition and the vector cycles read no loop order; the
         # evaluation and the matrix timing read no L3 order.
@@ -599,7 +599,7 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
         """Cycles the command's read streams lose to scratchpad bank switches,
         per role, and those of its first input fill and first weight set.
 
-        Each switch costs ``BANK_SWITCH_CYCLES``; a fused operand's
+        Each switch costs the recorded bank-switch cost; a fused operand's
         multi-beat requests overlap part of it (_tail_bank_switch_cycles).
         The input walk is the shared InputController's (_input_bank_walk).
         Bias reads and stores are not charged.
@@ -610,18 +610,22 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
         sizes = self._walked_bytes(mapping)
         if sizes["input"] > self.bank_size:
             key_loops, walk = self._input_bank_walk(mapping)
-            cycles["input"] = BANK_SWITCH_CYCLES * self._stream_switches(
-                mapping, key_loops, walk
+            cycles["input"] = self.timing_profile.soc[
+                "bank_switch_cycles"
+            ] * self._stream_switches(mapping, key_loops, walk)
+            first["input"] = (
+                self.timing_profile.soc["bank_switch_cycles"] * walk({})[0]
             )
-            first["input"] = BANK_SWITCH_CYCLES * walk({})[0]
         if sizes["weight"] > self.bank_size:
             key_loops, walk, held, one_set = self._weight_bank_walk(
                 mapping, policy
             )
-            cycles["weight"] = BANK_SWITCH_CYCLES * self._stream_switches(
-                mapping, key_loops, walk, held
+            cycles["weight"] = self.timing_profile.soc[
+                "bank_switch_cycles"
+            ] * self._stream_switches(mapping, key_loops, walk, held)
+            first["weight"] = (
+                self.timing_profile.soc["bank_switch_cycles"] * one_set[0]
             )
-            first["weight"] = BANK_SWITCH_CYCLES * one_set[0]
         if sizes.get("fused", 0) > self.bank_size:
             cycles.update(
                 self._tail_bank_switch_cycles(
