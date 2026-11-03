@@ -54,6 +54,7 @@ from torch.fx.operator_schemas import normalize_function
 import interstellar
 from voyager_compiler.codegen.node_info import (
     QMAP_PARAMS,
+    is_gemm_op,
     is_nop,
     quant_param_arg_nodes,
     require_allocation,
@@ -400,6 +401,7 @@ class _Emitter:
         self.boxes: Dict[str, Node] = {}
         # Destination-passing: producer -> {output index: destination}.
         self.dest: Dict[Node, Dict[Optional[int], TensorBoxRef]] = {}
+        self.vector_outputs: set[Node] = set()
 
     # --- references ------------------------------------------------------
 
@@ -741,8 +743,13 @@ class _Emitter:
                 f"voyager.insert(src.clone(), dst)"
             )
 
+        # Carry the store's route request onto its producer: the mapper must
+        # route that matrix output through the vector unit before memory.
+        output_via_vector = self._kwargs(node).get("output_via_vector", False)
         for producer, index in producers:
             self.dest.setdefault(producer, {})[index] = destination
+            if output_via_vector:
+                self.vector_outputs.add(producer)
 
     def _producers(self, node, gm, env, index=None):
         """The op(s) whose result this store writes, as ``[(node, index)]`` — or
@@ -813,6 +820,8 @@ class _Emitter:
             if isinstance(value, Node) and value in qmaps:
                 continue  # a qmap lookup table is not emittedan operand
             call.kwargs[key].CopyFrom(self._argument(value, env, internal))
+        if node in self.vector_outputs and is_gemm_op(node):
+            call.kwargs["output_via_vector"].scalar.bool_value = True
         return call
 
     def _kwargs(self, node) -> Dict[str, object]:
@@ -1001,6 +1010,16 @@ class _Emitter:
         op = Operation(name=node.name)
         for inner in chain:
             op.fused.op_list.append(self._call(inner, sub_env, internal))
+        # A fused vector tail already uses the vector output. An outlined
+        # bare matrix op still needs the store's explicit routing request.
+        if (
+            node in self.vector_outputs
+            and len(chain) == 1
+            and is_gemm_op(chain[0])
+        ):
+            op.fused.op_list[0].kwargs[
+                "output_via_vector"
+            ].scalar.bool_value = True
         self._set_outputs(op, node, env)
         if "interstellar_tiling" in node.meta:
             op.tiling.CopyFrom(_build_tiling(node))

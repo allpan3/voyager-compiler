@@ -1560,6 +1560,7 @@ def _reduction_inplace_kernel(
     async_pipeline: bool = False,
     last_idx: Optional[int] = None,
     wait_partial: bool = False,
+    output_via_vector: bool = False,
 ):
     """Kernel for a reduction with nothing left to do once it completes — no
     cast (the accumulator's dtype is the output's) and no fused tail.  It
@@ -1575,6 +1576,8 @@ def _reduction_inplace_kernel(
     ``wait_partial`` the round on the ``1`` coord also waits the ``0``
     round's compute-done (see ``_gemm_scratch_and_kernel``); ``last_idx``, the
     final reduction coord, drops that round's predicate when it is ``1``.
+    ``output_via_vector`` routes the first partial through the vector unit
+    so its start gate orders the next read without a dispatch wait.
     """
 
     def inner(grid_index, *args):
@@ -1600,7 +1603,7 @@ def _reduction_inplace_kernel(
     # ``K == 0`` inner cond.
     def init_body(grid_index, *args):
         *in_slots, out_slot = args
-        voyager.insert(compute(in_slots, True), out_slot)
+        voyager.insert(compute(in_slots, True), out_slot, output_via_vector)
 
     def accumulate_body(grid_index, *args):
         *in_slots, out_slot = args
@@ -1851,6 +1854,7 @@ def _reduction_fused_kernel(
     scratch_slots: int = 1,
     async_pipeline: bool = False,
     wait_partial: bool = False,
+    output_via_vector: bool = False,
 ):
     """Kernel for an op whose finished tile passes through scratch: a
     reduction over several K tiles, or a single round whose tail cannot ride
@@ -1896,6 +1900,8 @@ def _reduction_fused_kernel(
         wait_partial: The round on the ``1`` coord also waits the ``0``
             round's compute-done before it reads the partial (async variant
             only; see ``_gemm_scratch_and_kernel``).
+        output_via_vector: Route a bare first partial through the vector
+            unit, ordering the next vector read without a dispatch wait.
 
     Returns:
         The kernel callable for ``build_pipelined_buffers``.
@@ -1925,6 +1931,7 @@ def _reduction_fused_kernel(
         voyager.insert(
             torch.cond(grid_index[reduction_dim] == 0, init, accumulate),
             scratch,
+            output_via_vector,
         )
 
     def _finalize(in_slots, out_slots, scratch):
@@ -2279,8 +2286,9 @@ def _gemm_scratch_and_kernel(
     # bare op on the array, the matrix unit writes that partial to memory by
     # itself, and nothing orders round 1's read behind the writes: the vector
     # unit's start waits only for the previous vector pass, and round 1's
-    # commit for its own input loads.  So round 1 also waits round 0's
-    # compute-done.  A round 0 with a vector pass of its own (the dequantize
+    # commit for its own input loads.  Unless we route round 0 through the
+    # vector unit below, round 1 must wait for round 0's compute-done.
+    # A round 0 with a vector pass of its own (the dequantize
     # head below, a fused SpMM) is already ordered by that gate.  A caller
     # that passes ``split`` (the sparse GEMM) rebuilds its kernel under export
     # tracing, where this check cannot read the graph.
@@ -2305,6 +2313,25 @@ def _gemm_scratch_and_kernel(
             return dequantize(
                 op(in_tiles, first), *[in_tiles[i] for i in fused_idx]
             )
+
+    # Work around the missing dependency from round 0's direct matrix write
+    # to round 1's vector read. For each output tile, route the bare first
+    # partial through a pass-through vector operation. Later rounds already
+    # use the vector unit to add the previous partial. Its existing start gate
+    # then orders the read while the next round's matrix work can start early.
+    # This changes the data route, not the hardware synchronization interface.
+    # Keeping the direct write would require gating only the next vector start
+    # on that write's completion, independently of the next matrix start.
+    # Logical integer accumulators can be represented by floating torch tensors;
+    # use their tracked dtype and retain the dispatch wait for those types.
+    dtype = anchor.meta.get("dtype") or str(out_dtype).removeprefix("torch.")
+    output_via_vector = (
+        async_pipeline
+        and wait_partial
+        and dtype in ("bfloat16", "float32", "fp8_e4m3")
+    )
+    if output_via_vector:
+        wait_partial = False
 
     # A tail that only regroups the tile's dims computes nothing: each
     # round's partial takes the output's shape, and the reduction runs as
@@ -2350,6 +2377,7 @@ def _gemm_scratch_and_kernel(
             async_pipeline=async_pipeline,
             last_idx=num_k - 1,
             wait_partial=wait_partial,
+            output_via_vector=output_via_vector,
         )
     else:
         if single_buffer_tail and not async_pipeline and num_k > 1:
@@ -2379,6 +2407,7 @@ def _gemm_scratch_and_kernel(
             scratch_slots=slots,
             async_pipeline=async_pipeline,
             wait_partial=wait_partial,
+            output_via_vector=output_via_vector,
         )
     return scratch_specs, kernel
 
