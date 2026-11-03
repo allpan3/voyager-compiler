@@ -211,16 +211,23 @@ impl(voyager_lib, "subview", "CompositeExplicitAutograd")(_subview)
 torch.library.register_fake("voyager::subview")(_subview)
 
 
-voyager_lib.define("insert(Tensor src, Tensor(a!) dst) -> ()")
+voyager_lib.define(
+    "insert(Tensor src, Tensor(a!) dst, bool output_via_vector=False) -> ()"
+)
 
 
 @impl(voyager_lib, "insert", "CompositeExplicitAutograd")
-def insert(src: torch.Tensor, dst: torch.Tensor) -> None:
+def insert(
+    src: torch.Tensor, dst: torch.Tensor, output_via_vector: bool = False
+) -> None:
+    # Routing affects the hardware path, not the tensor value.
     dst.copy_(src)
 
 
 @torch.library.register_fake("voyager::insert")
-def _insert_fake(src: torch.Tensor, dst: torch.Tensor) -> None:
+def _insert_fake(
+    src: torch.Tensor, dst: torch.Tensor, output_via_vector: bool = False
+) -> None:
     return None
 
 
