@@ -2314,8 +2314,14 @@ def _gemm_scratch_and_kernel(
                 op(in_tiles, first), *[in_tiles[i] for i in fused_idx]
             )
 
-    # Route the first partial through the existing vector path so its
-    # completion gates the next vector read without delaying matrix issue.
+    # Work around the missing dependency from round 0's direct matrix write
+    # to round 1's vector read. For each output tile, route the bare first
+    # partial through a pass-through vector operation. Later rounds already
+    # use the vector unit to add the previous partial. Its existing start gate
+    # then orders the read while the next round's matrix work can start early.
+    # This changes the data route, not the hardware synchronization interface.
+    # Keeping the direct write would require gating only the next vector start
+    # on that write's completion, independently of the next matrix start.
     # Logical integer accumulators can be represented by floating torch tensors;
     # use their tracked dtype and retain the dispatch wait for those types.
     dtype = anchor.meta.get("dtype") or str(out_dtype).removeprefix("torch.")

@@ -211,6 +211,10 @@ impl(voyager_lib, "subview", "CompositeExplicitAutograd")(_subview)
 torch.library.register_fake("voyager::subview")(_subview)
 
 
+# output_via_vector requests a matrix -> vector -> memory stream, with no
+# extra arithmetic or scratchpad copy. A bare first K-split partial uses this
+# route so the existing vector completion gate orders the next partial read;
+# it works around a missing dependency from a direct matrix write to that read.
 voyager_lib.define(
     "insert(Tensor src, Tensor(a!) dst, bool output_via_vector=False) -> ()"
 )

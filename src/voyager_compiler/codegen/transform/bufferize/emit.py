@@ -743,6 +743,8 @@ class _Emitter:
                 f"voyager.insert(src.clone(), dst)"
             )
 
+        # Carry the store's route request onto its producer: the mapper must
+        # route that matrix output through the vector unit before memory.
         output_via_vector = self._kwargs(node).get("output_via_vector", False)
         for producer, index in producers:
             self.dest.setdefault(producer, {})[index] = destination
