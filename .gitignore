@@ -14,7 +14,6 @@ slurm_scripts
 test/*
 !test/test_codegen.py
 !test/run_ci.py
-!test/test_ksplit_overlap.py
 wandb
 .vscode
 tools/artifacts/shards/
