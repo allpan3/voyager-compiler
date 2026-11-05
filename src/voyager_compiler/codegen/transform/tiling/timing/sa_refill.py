@@ -11,7 +11,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from functools import lru_cache
 
-from .sa_pipeline import OutputPattern, PipelineEstimate, _Schedule
+from .sa_pipeline import OutputPattern, OutputSchedule, PipelineEstimate
 
 
 @dataclass(frozen=True)
@@ -97,11 +97,10 @@ class _Banks:
             self.spans[bank] = [(a + cycles, b + cycles) for a, b in spans]
 
 
-class _RefillSchedule(_Schedule):
+class _RefillSchedule(OutputSchedule):
     def __init__(self, beats, slots, skew, profile, vector, transfers):
-        super().__init__(beats, slots, 0, skew, profile, vector, transfers)
+        super().__init__(beats, slots, skew, profile, vector, transfers)
         self.skew = skew
-        self.profile = profile
         self.banks = _Banks()
         self.output_bank = None
         self.shared_output = False
@@ -123,53 +122,14 @@ class _RefillSchedule(_Schedule):
         finally:
             self.output_only = previous
 
-    def emit(self):
+    def store(self, start, forward):
         if not self.shared_output:
-            super().emit()
-            return
-        if not self.vector:
-            dequeues = self.histories[0]
-            if len(dequeues) == dequeues.maxlen:
-                self.producer = max(self.producer, dequeues[0] + 1)
-            forward = self.profile.direct_store_forward_cycles
-            earliest = max(
-                self.producer + 1,
-                self.store_end + 1 - forward,
-                self.gate,
-            )
-            first, self.store_end = self.banks.reserve(
-                self.output_bank, earliest + forward, self.beats
-            )
-            dequeues.append(max(earliest, first - forward))
-            return
-        time = self.producer
-        for stage, (capacity, forward) in enumerate(self.stages):
-            store = stage == len(self.stages) - 1
-            if self.histories[stage]:
-                time = max(
-                    time,
-                    self.histories[stage][-1] + (self.beats if store else 1),
-                )
-            if len(self.histories[stage + 1]) >= capacity:
-                time = max(
-                    time,
-                    self.histories[stage + 1][-capacity] + (0 if store else 1),
-                )
-            if stage == 2:
-                time = max(time, self.gate)
-            if store:
-                time = max(time, self.store_end + 1 - forward)
-                first, last = self.banks.reserve(
-                    self.output_bank, time + forward, self.beats
-                )
-                time = max(time, first - forward)
-                self.store_end = last
-            self.histories[stage].append(time)
-            if stage == 0:
-                self.producer = time
-            time = last if store else time + forward
-        self.histories[-1].append(time)
-        self.gate += 1
+            return super().store(start, forward)
+        start = max(start, self.store_end + 1 - forward)
+        first, self.store_end = self.banks.reserve(
+            self.output_bank, start + forward, self.beats
+        )
+        return max(start, first - forward), self.store_end
 
     def state(self, commands=False):
         if self.output_only:

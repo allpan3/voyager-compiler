@@ -90,6 +90,12 @@ class TimingProfile:
             else set()
         ) & {"cim", "sa_output_pipeline", "sa_input_pipeline"}
         _keys(data["accelerator"], ACCELERATOR_FIELDS | optional, "accelerator")
+        sa_records = {"sa_input_pipeline", "sa_output_pipeline"}
+        if optional & sa_records and not sa_records <= optional:
+            raise ValueError(
+                "SA timing requires both input and output pipeline records; "
+                "omit both to use architectural timing"
+            )
         if "cim" in optional:
             _keys(data["accelerator"]["cim"], CIM_FIELDS, "accelerator.cim")
         _keys(data["soc"], SOC_FIELDS, "soc")

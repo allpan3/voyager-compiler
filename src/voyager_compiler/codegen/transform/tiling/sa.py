@@ -20,9 +20,7 @@ from voyager_compiler.codegen.transform.tiling.timing.sa_output import (
 from voyager_compiler.codegen.transform.tiling.timing.sa_pipeline import (
     CommandTransfers,
     OutputPattern,
-    direct_timing,
     output_events,
-    pipeline_timing,
 )
 from voyager_compiler.codegen.transform.tiling.timing.sa_refill import (
     InputTile,
@@ -150,9 +148,9 @@ class RuntimeCalculator(BaseRuntimeCalculator):
     outside the mapping shares a weight tile among the elements of one
     group.  Energy is interstellar's cost model, not this one.
 
-    A matching physical profile schedules dense direct and vector output
-    across commands, including finite stage storage, retirement and DMA
-    dependencies. An input profile supplies measured startup intervals.
+    Matching input and output profiles schedule dense direct and vector
+    output across commands, including operand refills, finite stage storage,
+    retirement and DMA dependencies.
 
     The compute of an L2 block is the busier of the matrix unit and the
     scratchpad bus.  The matrix unit charges the systolic passes, each weight
@@ -444,7 +442,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
             for level in (1, 2)
         )
 
-    def _output_pipeline(self, mapping, bank_groups):
+    def _output_pipeline(self, mapping):
         profile = self.timing_profile.sa_output_pipeline
         if profile is None:
             return None
@@ -566,7 +564,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         return tuple(tiles)
 
     def _refill_runtime(self, mapping, bank_groups, transfers):
-        profile = self._output_pipeline(mapping, bank_groups)
+        profile = self._output_pipeline(mapping)
         startup = self.timing_profile.accelerator.get("sa_input_pipeline")
         if profile is None or startup is None:
             return None
@@ -627,18 +625,9 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         )
         if self.dram_untimed:
             transfers = None
-        refined = self._refill_runtime(mapping, bank_groups, transfers)
-        if refined is not None:
-            return refined
-        if (
-            self.dram_untimed
-            or self._output_pipeline(mapping, bank_groups) is None
-        ):
-            return None
-        cycles = self.matrix_cycles(mapping, bank_groups, transfers=transfers)
-        return cycles * commands if cycles is not None else None
+        return self._refill_runtime(mapping, bank_groups, transfers)
 
-    def matrix_cycles(self, mapping, bank_groups, *, transfers=None):
+    def matrix_cycles(self, mapping, bank_groups):
         """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
         each costing the busier of the matrix unit -- its systolic passes,
         plus the back-pressure a single-buffered accumulator takes while the
@@ -664,7 +653,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
             bank_groups: Its bank partition as role sets (``bank_partition``),
                 or ``None`` when nothing shares a bank.
         """
-        refined = self._refill_runtime(mapping, bank_groups, transfers)
+        refined = self._refill_runtime(mapping, bank_groups, None)
         if refined is not None:
             return refined / (self._l3_blocks(mapping) * self.batch)
         blockings = mapping.loop_blockings
@@ -746,13 +735,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
                 l2_blocks *= blockings[i][2]
 
         output = None
-        pipeline = self._output_pipeline(mapping, bank_groups)
-        if pipeline is not None:
-            work, arrivals = output_events(
-                self._output_levels(mapping), partitionings[le.IC][0]
-            )
-            computation_l1_time = work / l2_blocks
-        elif not parked:
+        if not parked:
             output = self.output_timing(mapping, vector_beats)
             computation_l1_time = output.producer_cycles / l2_blocks
 
@@ -819,26 +802,6 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         # tile while the other computes the next -- so a block costs the
         # busier of the two.
         bank = self._bank_cycles(words, bank_groups)
-        if (
-            pipeline is not None
-            and self._bank_cycles(
-                {
-                    role: count
-                    for role, count in words.items()
-                    if role != "output"
-                },
-                bank_groups,
-            )
-            > computation_l1_time
-        ):
-            # Output service is already scheduled, including wide stores.
-            # A bandwidth bound alone cannot place input-induced gaps within
-            # the stream. Retain the existing estimate for that unmodeled case.
-            if transfers is not None:
-                return None
-            pipeline = None
-            output = self.output_timing(mapping, vector_beats)
-            computation_l1_time = output.producer_cycles / l2_blocks
         block_time = max(computation_l1_time, bank)
         # The tail's words do not spread over the block: they land as a
         # burst on a few of its sweeps, and on a bank that feeds one of the
@@ -884,31 +847,6 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         # Keep output work outstanding at the end of the sweep. Do not count
         # it twice when the memory/SpMM resource bound already covers it.
         buffer_fill = self._bank_cycles(loads, bank_groups)
-        if pipeline is not None:
-            commands = self._l3_blocks(mapping) * self.batch
-            # Skewer.h uses PE_LATENCY=2 along the reduction dimension;
-            # horizontal propagation is one cycle per column. With no input
-            # record, this path accounts only for geometric propagation.
-            skew = 2 * partitionings[le.IC][0] + partitionings[le.OC][0] - 1
-            schedule = pipeline_timing if self.has_tail else direct_timing
-            scheduled = schedule(
-                work,
-                arrivals,
-                commands,
-                2 if self.double_buffered_l2 else 1,
-                math.ceil(buffer_fill),
-                skew,
-                vector_beats,
-                pipeline,
-                transfers,
-            )
-            return (
-                max(
-                    scheduled.cycles,
-                    l2_blocks * block_time * commands + buffer_fill + skew,
-                )
-                / commands
-            )
         skew = partitionings[le.IC][0] + partitionings[le.OC][0] - 2
         drain = output_size * vector_beats if parked else 0
         steady = l2_blocks * block_time

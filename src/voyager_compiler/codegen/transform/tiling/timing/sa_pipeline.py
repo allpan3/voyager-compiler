@@ -250,12 +250,10 @@ class PipelineEstimate:
     commands: int
 
 
-class _Schedule:
+class OutputSchedule:
     """Timing state at a loop boundary, shared by direct and vector routes."""
 
-    def __init__(
-        self, beats, slots, fill, skew, profile, vector, transfers=None
-    ):
+    def __init__(self, beats, slots, skew, profile, vector, transfers=None):
         self.stages = (
             ((OUTPUT_FIFO_VECTORS, 1), *profile.stages) if vector else ()
         )
@@ -267,23 +265,30 @@ class _Schedule:
         self.histories = [
             deque(maxlen=capacity) for _ in range(len(self.stages) + 1)
         ]
-        self.producer = fill + skew
+        self.producer = skew
+        self.profile = profile
         self.gate = 0
         self.vector = vector
         self.transfers = _Transfers(transfers, slots) if transfers else None
+
+    def store(self, start, forward):
+        """Return the stage departure and final beat on a dedicated output bank."""
+        return start, start + forward + self.beats - 1
 
     def emit(self):
         if not self.vector:
             dequeues = self.histories[0]
             if len(dequeues) == OUTPUT_FIFO_VECTORS:
                 self.producer = max(self.producer, dequeues[0] + 1)
-            dequeues.append(
-                max(
-                    self.producer + 1,
-                    dequeues[-1] + self.beats if dequeues else 0,
-                    self.gate,
-                )
+            start = max(
+                self.producer + 1,
+                dequeues[-1] + self.beats if dequeues else 0,
+                self.gate,
             )
+            start, _ = self.store(
+                start, self.profile.direct_store_forward_cycles
+            )
+            dequeues.append(start)
             return
         time = self.producer
         for stage, (capacity, forward) in enumerate(self.stages):
@@ -300,10 +305,12 @@ class _Schedule:
                 # Router arithmetic waits for command start. Interface
                 # registers before it can prefetch the next command's data.
                 time = max(time, self.gate)
+            if store:
+                time, finish = self.store(time, forward)
             self.histories[stage].append(time)
             if stage == 0:
                 self.producer = time
-            time += forward + (self.beats - 1 if store else 0)
+            time = finish if store else time + forward
         if self.histories[-1]:
             time = max(time, self.histories[-1][-1] + self.beats)
         self.histories[-1].append(time)
@@ -388,91 +395,3 @@ class _Schedule:
         # state for every vector in a long uniform burst.
         stride = 1 if pattern.child else self.histories[0].maxlen
         self.repeat(pattern.repeat, body, vectors, stride=stride)
-
-
-def _timing(
-    work,
-    arrivals,
-    commands,
-    slots,
-    fill,
-    skew,
-    beats,
-    profile,
-    vector,
-    transfers=None,
-):
-    state = _Schedule(beats, slots, fill, skew, profile, vector, transfers)
-    # The measured gap ends at the next command's first output enqueue.
-    # The output pattern counts that first issue, so subtract its cycle here.
-    restart = max(work - arrivals.cycles, profile.writeback_restart_cycles - 1)
-    tail = 0 if vector else profile.direct_store_forward_cycles + beats - 1
-
-    def command():
-        # Approximate completion at the last store. The compiler retires the
-        # oldest occupied command slot before filling a new input buffer.
-        state.gate = state.finished[-1] + 1 if state.finished else 0
-        ready = (
-            state.finished[0] + fill + skew
-            if len(state.finished) == slots
-            else 0
-        )
-        if state.transfers:
-            ready = max(ready, state.transfers.dispatch() + fill + skew)
-        if state.finished:
-            state.producer += restart
-        state.producer = max(state.producer, ready)
-        state.pattern(arrivals)
-        state.finished.append(state.histories[-1][-1] + tail)
-        if state.transfers:
-            state.transfers.retire(state.finished)
-
-    state.repeat(commands, command, arrivals.vectors, commands=True)
-    return PipelineEstimate(
-        (
-            state.transfers.finish(state.finished[-1])
-            if state.transfers
-            else state.finished[-1]
-        ),
-        state.producer,
-        commands * work,
-        commands,
-    )
-
-
-@lru_cache(maxsize=256)
-def pipeline_timing(
-    work, arrivals, commands, slots, fill, skew, beats, profile, transfers=None
-):
-    """Time the vector pipeline, batching only exact repeated timing states."""
-    return _timing(
-        work,
-        arrivals,
-        commands,
-        slots,
-        fill,
-        skew,
-        beats,
-        profile,
-        True,
-        transfers,
-    )
-
-
-@lru_cache(maxsize=256)
-def direct_timing(
-    work, arrivals, commands, slots, fill, skew, beats, profile, transfers=None
-):
-    """Time direct stores and their FIFO, including command retirement."""
-    return _timing(
-        work,
-        arrivals,
-        commands,
-        slots,
-        fill,
-        skew,
-        beats,
-        profile,
-        False,
-        transfers,
-    )
