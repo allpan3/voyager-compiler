@@ -145,9 +145,6 @@ class TimingProfile:
                 _keys(
                     values,
                     {
-                        "parameter_forward_cycles",
-                        "input_request_start_cycles",
-                        "weight_request_start_cycles",
                         "input_buffer_forward_cycles",
                         "weight_buffer_forward_cycles",
                         "input_buffer_read_cycles",

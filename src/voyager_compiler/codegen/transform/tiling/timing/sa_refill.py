@@ -251,7 +251,6 @@ def refill_timing(
     periods,
     skew,
     parameter_cycles,
-    request_start,
     read_forward,
     read_latency,
     beats,
@@ -273,9 +272,9 @@ def refill_timing(
         for g, p in zip(groups, periods)
         if slots > 1 and groups.count(g) > 1
     )
-    restart = (
-        profile.writeback_restart_cycles + profile.writeback_forward_cycles - 1
-    )
+    # Restart spans output enqueue to output enqueue; the pattern adds the
+    # first issue cycle. This repeated gate may overlap input/DMA readiness.
+    restart = profile.writeback_restart_cycles - 1
     count = len(tiles)
 
     def bank(role, command):
@@ -310,6 +309,8 @@ def refill_timing(
             state.ports[role] = last + 1
             state.ready[role][slot] = last + 1 + read_forward[role]
 
+        # Omit short controller request startup; refill and resource waits
+        # still determine when each operand becomes available.
         for index in range(min(2, count)):
             for role in (0, 1):
                 if role == 1 and index >= len(weight_tiles):
@@ -317,19 +318,13 @@ def refill_timing(
                 load(
                     role,
                     index,
-                    dispatch + parameter_cycles + request_start[role],
+                    dispatch + parameter_cycles,
                 )
         state.producer = max(
             state.producer + (restart if command else 0),
             max(role[0] for role in state.ready) + skew,
         )
-        state.gate = (
-            state.finished[-1]
-            + 1
-            + (profile.vector_start_cycles if vector else 0)
-            if state.finished
-            else 0
-        )
+        state.gate = state.finished[-1] + 1 if state.finished else 0
         index = 0
         seen = {}
         # Leave the final prefetch and weight-release transitions explicit.
@@ -392,27 +387,13 @@ def refill_timing(
             if index + 2 < count:
                 load(0, index + 2, release)
             index += 1
-        if state.shared_output:
-            done = state.store_end + (
-                profile.vector_done_cycles
-                if vector
-                else profile.direct_done_cycles
-            )
-        else:
+        # Approximate command completion at its final accepted store beat.
+        if not state.shared_output:
             tail = (
-                profile.vector_done_cycles
-                if vector
-                else profile.direct_store_forward_cycles
-                + beats
-                - 1
-                + profile.direct_done_cycles
+                0 if vector else profile.direct_store_forward_cycles + beats - 1
             )
-            done = state.histories[-1][-1] + tail
-            state.store_end = done - (
-                profile.vector_done_cycles
-                if vector
-                else profile.direct_done_cycles
-            )
+            state.store_end = state.histories[-1][-1] + tail
+        done = state.store_end
         state.finished.append(done)
         if state.transfers:
             state.transfers.retire(state.finished)

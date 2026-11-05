@@ -607,9 +607,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
             skew,
             matrix_parameter_cycles(
                 self.input_dtype_width, self.weight_dtype_width
-            )
-            + startup["parameter_forward_cycles"],
-            tuple(startup[r + "_request_start_cycles"] for r in roles[:2]),
+            ),
             tuple(startup[r + "_buffer_forward_cycles"] for r in roles[:2]),
             tuple(startup[r + "_buffer_read_cycles"] for r in roles[:2]),
             beats,

@@ -37,27 +37,19 @@ TARGET_FIELDS = (
 class SAOutputPipeline:
     target: tuple
     stages: tuple
-    vector_start_cycles: int
-    vector_done_cycles: int
     writeback_restart_cycles: int
-    writeback_forward_cycles: int
     direct_store_forward_cycles: int
-    direct_done_cycles: int
 
     @classmethod
     def from_dict(cls, value):
         if not isinstance(value, dict) or set(value) != {
             "target",
             "stages",
-            "vector_start_cycles",
-            "vector_done_cycles",
             "writeback_restart_cycles",
-            "writeback_forward_cycles",
             "direct_store_forward_cycles",
-            "direct_done_cycles",
         }:
             raise ValueError(
-                "SA output pipeline requires target, stages and command delays"
+                "SA output pipeline requires target, stages, writeback and store delays"
             )
         target = value["target"]
         if not isinstance(target, dict) or set(target) != set(TARGET_FIELDS):
@@ -83,21 +75,19 @@ class SAOutputPipeline:
             raise ValueError(
                 "SA geometry, capacities and delays must be positive integers"
             )
-        delays = [
-            value[name]
-            for name in (
-                "vector_start_cycles",
-                "vector_done_cycles",
-                "writeback_restart_cycles",
-                "writeback_forward_cycles",
-                "direct_store_forward_cycles",
-                "direct_done_cycles",
+        restart = value["writeback_restart_cycles"]
+        if type(restart) is not int or restart < 1:
+            raise ValueError("SA writeback restart must be a positive integer")
+        forward = value["direct_store_forward_cycles"]
+        if type(forward) is not int or forward < 0:
+            raise ValueError(
+                "SA direct-store delay must be a nonnegative integer"
             )
-        ]
-        if any(type(n) is not int or n < 0 for n in delays):
-            raise ValueError("SA command delays must be nonnegative integers")
         return cls(
-            tuple(target[k] for k in TARGET_FIELDS), tuple(records), *delays
+            tuple(target[k] for k in TARGET_FIELDS),
+            tuple(records),
+            restart,
+            forward,
         )
 
 
@@ -413,26 +403,15 @@ def _timing(
     transfers=None,
 ):
     state = _Schedule(beats, slots, fill, skew, profile, vector, transfers)
-    # Restart ends at the next writeback input; forward ends at its output.
-    # The pattern counts its first issue as cycle one, hence subtraction.
-    restart = max(
-        work - arrivals.cycles,
-        profile.writeback_restart_cycles + profile.writeback_forward_cycles - 1,
-    )
-    start = profile.vector_start_cycles if vector else 0
-    tail = (
-        profile.vector_done_cycles
-        if vector
-        else profile.direct_store_forward_cycles
-        + beats
-        - 1
-        + profile.direct_done_cycles
-    )
+    # The measured gap ends at the next command's first output enqueue.
+    # The output pattern counts that first issue, so subtract its cycle here.
+    restart = max(work - arrivals.cycles, profile.writeback_restart_cycles - 1)
+    tail = 0 if vector else profile.direct_store_forward_cycles + beats - 1
 
     def command():
-        # Output commands serialize on done. The compiler also retires the
+        # Approximate completion at the last store. The compiler retires the
         # oldest occupied command slot before filling a new input buffer.
-        state.gate = state.finished[-1] + 1 + start if state.finished else 0
+        state.gate = state.finished[-1] + 1 if state.finished else 0
         ready = (
             state.finished[0] + fill + skew
             if len(state.finished) == slots
