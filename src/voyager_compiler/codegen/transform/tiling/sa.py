@@ -1,39 +1,51 @@
 """Systolic architecture, loop constraints, and matrix runtime estimates."""
 
+import itertools
 import math
+import warnings
 
 import interstellar
 from voyager_compiler.codegen.transform.tiling.cost import (
-    BANK_SWITCH_CYCLES,
     strided_bank_walk,
 )
 from voyager_compiler.codegen.transform.tiling.input import input_buffer_usage
 from voyager_compiler.codegen.transform.tiling.runtime import (
-    BaseRuntimeCalculator,
     _FL_DIMS,
     _IF_DIMS,
+    BaseRuntimeCalculator,
+)
+from voyager_compiler.codegen.transform.tiling.timing.sa_output import (
+    output_timing,
+)
+from voyager_compiler.codegen.transform.tiling.timing.sa_pipeline import (
+    CommandTransfers,
+    OutputPattern,
+    output_events,
+)
+from voyager_compiler.codegen.transform.tiling.timing.sa_refill import (
+    InputTile,
+    refill_timing,
 )
 
 le = interstellar.le
-
-# Finished output vectors the matrix -> vector path holds before a
-# single-buffered accumulator's array feels the tail's drain rate: the
-# matrix processor's output FIFO (8), the vector pipeline's input FIFO (9)
-# and the stages between.  Measured on the E4M3x16x16 SoC as 20 (MobileBERT
-# GEMMs) to 40 (ResNet18) vectors; either way the error is under ~60 cycles
-# per L3 step.
-OUTPUT_SLACK = 24
-
-# Cycles the SpMM unit spends per row of each PE-array-wide pass on top of
-# the row's outliers: it drains and restarts its accumulator ring between
-# rows.  Measured on the Sphinx SoC: 7.3-7.5.
-SPMM_ROW_CYCLES = 8
 
 # Block-scale rows the SpMM unit's weight-scale buffer holds
 # (``DoubleBuffer<32>`` in ``SpMMUnit.h``, fixed in the Sphinx silicon).  A
 # streaming weight tile takes one row per K block per inner OC pass, and the
 # hardware wraps the address rather than checking it.
 SPMM_SCALE_ROWS = 32
+
+
+def matrix_parameter_cycles(input_bits, weight_bits):
+    """Serialize the dense MatrixParams layout onto its 64-bit channel.
+
+    Params.h declares 32-bit addresses, 16-bit loop bounds and 16 codebook
+    entries per operand. The characterized INT8 build has one-bit dtype
+    indices and disables SpMM, so no sparse address fields are present.
+    """
+    base_bits = 8 * 32 + 22 * 16 + 21 * 3 + 3 * 8 + 2 + 3 + 13 + 32
+    extra_bits = 3 + 36 + 16 * (input_bits + weight_bits) + 4
+    return math.ceil((base_bits + extra_bits) / 64)
 
 
 def spmm_scale_rows(mapping):
@@ -136,12 +148,16 @@ class RuntimeCalculator(BaseRuntimeCalculator):
     outside the mapping shares a weight tile among the elements of one
     group.  Energy is interstellar's cost model, not this one.
 
+    Matching input and output profiles schedule dense direct and vector
+    output across commands, including operand refills, finite stage storage,
+    retirement and DMA dependencies.
+
     The compute of an L2 block is the busier of the matrix unit and the
     scratchpad bus.  The matrix unit charges the systolic passes, each weight
     tile costing the longer of its loading and the rows streamed through it,
-    plus the back-pressure of a single-buffered accumulator against
-    ``OUTPUT_SLACK`` of buffering.  The bus charges the words every operand
-    role moves, summed per bank group of the planner's partition with the
+    plus final-output FIFO backpressure across the L1/L2 loop nest.
+    The bus charges the words each operand role
+    moves, summed per bank group of the planner's partition with the
     busiest bank setting the pace: input and weight rows in whole beats,
     packed as the toolchain packs them, with the read interface's lost cycle
     whenever an aligned request follows an unaligned one; block scales one
@@ -155,7 +171,8 @@ class RuntimeCalculator(BaseRuntimeCalculator):
     slower.  The ramps of a sweep, the first buffer fill, the systolic skew
     and the last drain, are spread over the ops the sweep dispatches.
 
-    Not modeled are the per-op costs (parameter load, deserialisation, the
+    Without a matching physical profile, the remaining omissions are per-op
+    costs (parameter load, deserialisation, the
     start/done handshake, the drain between uncommitted ops, the host's
     dispatch time), so an op that runs alone pays its ramps in full where
     the spreading charges a share; the cycle-exact datapath, the systolic
@@ -166,6 +183,22 @@ class RuntimeCalculator(BaseRuntimeCalculator):
     switches; and the outlier density of an individual tile, priced at the
     layer's average.
     """
+
+    def __init__(self, *args, vector_lanes=None, has_spmm=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vector_lanes = vector_lanes
+        self.has_spmm = has_spmm
+
+    def _vector_output(self, mapping):
+        # Split-K accumulation adds the previous partial in the vector unit.
+        # As with the existing scratch traffic bound, price its recurring
+        # accumulation pass; the first pass can bypass that addition.
+        return (
+            self.has_spmm
+            or self.outlier_rate > 0
+            or mapping.loop_blockings[le.IC][3] > 1
+            or (self.has_tail and not self.single_k_tail_extra_pass)
+        )
 
     def _load_words(self, mapping):
         """Bus words one L1 tile's every-round operands take, per role: the
@@ -224,28 +257,15 @@ class RuntimeCalculator(BaseRuntimeCalculator):
             )
         return words
 
-    def _bank_switch_cycles(self, mapping):
-        """Cycles one L3 step's input and weight streams lose to bank
-        switches, per role (``BANK_SWITCH_CYCLES`` each).
-
-        Follow the mapping's L1 input order (_input_bank_walk) and the
-        weight FY/FX/IC/OC scan. Packing combines adjacent channel groups
-        into a request exactly when the toolchain permits it, matching
-        _request_words. Buffers start on banks; input scales are not
-        included. A weight tile held across spatial loops is not refetched
-        by them.
-        """
-        if self.independent_memory_ports or not self.bank_size:
-            return {}
+    def _weight_bank_walk(self, mapping):
+        """Scratchpad bank sequence of one local weight-buffer fill."""
         b = mapping.loop_blockings
-        orders = mapping.loop_orders
         ic3 = self._extent(mapping, le.IC, 2)
         oc3 = self._extent(mapping, le.OC, 2)
         ic1 = self._extent(mapping, le.IC, 1)
         oc1 = self._extent(mapping, le.OC, 1)
         fy, fx = b[le.FY][1], b[le.FX][1]
         oc_dim = mapping.loop_partitionings[le.OC][0]
-        input_loops, input_walk = self._input_bank_walk(mapping)
 
         pitch_w = oc3 * self.weight_dtype_width / 8
         beat_w = oc1 * self.weight_dtype_width / 8
@@ -268,6 +288,26 @@ class RuntimeCalculator(BaseRuntimeCalculator):
                 loops, width, self.bank_size, c0 * pitch_w + k_off
             )
 
+        return weight_walk
+
+    def _bank_switch_cycles(self, mapping):
+        """Cycles one L3 step's input and weight streams lose to bank
+        switches, per role (the recorded bank-switch cost each).
+
+        Follow the mapping's L1 input order (_input_bank_walk) and the
+        weight FY/FX/IC/OC scan. Packing combines adjacent channel groups
+        into a request exactly when the toolchain permits it, matching
+        _request_words. Buffers start on banks; input scales are not
+        included. A weight tile held across spatial loops is not refetched
+        by them.
+        """
+        if self.independent_memory_ports or not self.bank_size:
+            return {}
+        b = mapping.loop_blockings
+        orders = mapping.loop_orders
+        input_loops, input_walk = self._input_bank_walk(mapping)
+        weight_walk = self._weight_bank_walk(mapping)
+
         held = ()
         if b[le.IC][2] == 1:
             held = tuple(
@@ -276,9 +316,9 @@ class RuntimeCalculator(BaseRuntimeCalculator):
                 if orders[loop][2] < orders[le.OC][2]
             )
         return {
-            "input": BANK_SWITCH_CYCLES
+            "input": self.timing_profile.soc["bank_switch_cycles"]
             * self._stream_switches(mapping, input_loops, input_walk),
-            "weight": BANK_SWITCH_CYCLES
+            "weight": self.timing_profile.soc["bank_switch_cycles"]
             * self._stream_switches(mapping, (le.OC, le.IC), weight_walk, held),
         }
 
@@ -369,6 +409,224 @@ class RuntimeCalculator(BaseRuntimeCalculator):
             stall = max(stall, fraction * excess)
         return stall
 
+    def output_timing(self, mapping, cycles_per_vector):
+        """Final-output queue estimate for a streaming SA command.
+
+        The full-model memory and SpMM estimates remain resource bounds;
+        this queue isolates output-rate backpressure, not their interactions.
+        """
+        warnings.warn(
+            "SA output timing is an architectural estimate, not RTL-calibrated. "
+            "Additional pipeline storage/delays and interactions with downstream "
+            "stalls are not modeled.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        levels = self._output_levels(mapping)
+        return output_timing(
+            levels,
+            mapping.loop_partitionings[le.IC][0],
+            cycles_per_vector,
+        )
+
+    @staticmethod
+    def _output_levels(mapping):
+        return tuple(
+            tuple(
+                (le.table[dim], mapping.loop_blockings[dim][level])
+                for dim in sorted(
+                    (d for d in range(le.NUM) if d != le.ON),
+                    key=lambda d: mapping.loop_orders[d][level],
+                )
+            )
+            for level in (1, 2)
+        )
+
+    def _output_pipeline(self, mapping):
+        profile = self.timing_profile.sa_output_pipeline
+        if profile is None:
+            return None
+        # The characterized routes use dense single-bank accumulation, with
+        # direct stores or a riding vector tail. Fetched vector operands and
+        # split reductions retain their architectural resource bounds.
+        if (
+            (
+                not self.has_tail
+                and self.output_dtype_width != self.accum_dtype_width
+            )
+            or self.single_k_tail_extra_pass
+            or self.tail_specs
+            or self.has_spmm
+            or self.outlier_rate
+            or self.bias_width
+            or self.double_buffered_accum_buffer
+            or mapping.loop_blockings[le.IC][3] != 1
+            or self.input_scale_width
+            or self.weight_scale_width
+            or self.output_scale_width
+        ):
+            return None
+        geometry = (
+            mapping.loop_partitionings[le.IC][0],
+            mapping.loop_partitionings[le.OC][0],
+            self.vector_lanes,
+            self.input_dtype_width,
+            self.weight_dtype_width,
+            self.accum_dtype_width,
+            self.output_dtype_width,
+            self.sram_bandwidth,
+        )
+        if self.has_tail:
+            matches = profile.target == geometry
+        else:
+            # The output_bits target describes the vector route. Direct stores
+            # retain accumulation precision, checked above; other build widths
+            # and geometry must still match.
+            matches = (
+                profile.target[:6] + profile.target[7:]
+                == geometry[:6] + geometry[7:]
+            )
+        return profile if matches else None
+
+    def _refill_tiles(self, mapping):
+        """L1 fills in controller order, with final reductions marked.
+
+        WeightController retains a complete local tile across outer spatial
+        reuse. MatrixProcessor can additionally retain the PE weights when
+        the inner reduction and output-channel loops each have one step.
+        """
+        b, orders = mapping.loop_blockings, mapping.loop_orders
+        levels = self._output_levels(mapping)
+        rows = mapping.loop_partitionings[le.IC][0]
+        inner = dict(levels[0])
+        local_levels = levels[0], tuple((name, 1) for name, _ in levels[1])
+        work, outputs = output_events(local_levels, rows)
+        held = tuple(
+            dim
+            for dim in (le.OX, le.OY)
+            if b[le.IC][2] == 1 and orders[dim][2] < orders[le.OC][2]
+        )
+        array_held = (
+            held
+            and all(inner[n] == 1 for n in ("IC", "FX", "FY", "OC"))
+            and all(b[d][2] == 1 for d in (le.IC, le.FX, le.FY))
+        )
+        dims = sorted(
+            (d for d in range(le.NUM) if d != le.ON),
+            key=lambda d: -orders[d][2],
+        )
+        loads = self._load_words(mapping)
+        _, walk = self._input_bank_walk(mapping)
+        weight_walk = self._weight_bank_walk(mapping)
+        switch_cost = (
+            0
+            if self.independent_memory_ports or not self.bank_size
+            else self.timing_profile.soc["bank_switch_cycles"]
+        )
+        previous_bank = previous_weight_bank = None
+        tiles = []
+        for coordinates in itertools.product(*(range(b[d][2]) for d in dims)):
+            at = dict(zip(dims, coordinates))
+            switches = 0
+            if switch_cost:
+                switches, first, last = walk(at)
+                switches += previous_bank is not None and first != previous_bank
+                previous_bank = last
+            weight = (
+                0 if any(at[d] for d in held) else math.ceil(loads["weight"])
+            )
+            weight_rows = weight
+            if weight and switch_cost:
+                changes, first, last = weight_walk(at)
+                changes += (
+                    previous_weight_bank is not None
+                    and first != previous_weight_bank
+                )
+                previous_weight_bank = last
+                weight += switch_cost * changes
+            final = all(at[d] == b[d][2] - 1 for d in (le.IC, le.FX, le.FY))
+            tile_work, tile_outputs = work, outputs
+            if array_held and any(at[d] for d in held):
+                spatial = inner["OX"] * inner["OY"]
+                tile_work = spatial
+                tile_outputs = OutputPattern(spatial)
+            tiles.append(
+                InputTile(
+                    (
+                        math.ceil(loads["input"] + switch_cost * switches),
+                        weight,
+                    ),
+                    tile_work,
+                    tile_outputs if final else None,
+                    weight_rows,
+                )
+            )
+        return tuple(tiles)
+
+    def _refill_runtime(self, mapping, bank_groups, transfers):
+        profile = self._output_pipeline(mapping)
+        startup = self.timing_profile.accelerator.get("sa_input_pipeline")
+        if profile is None or startup is None:
+            return None
+        commands = self._l3_blocks(mapping) * self.batch
+        groups = (
+            (bank_groups or ()) if not self.independent_memory_ports else ()
+        )
+        roles = ("input", "weight", "output")
+        membership = tuple(
+            next(
+                (i for i, group in enumerate(groups) if role in group),
+                len(groups) + j,
+            )
+            for j, role in enumerate(roles)
+        )
+        periods = (
+            commands // self._batch_loads(mapping, _IF_DIMS, self.batch),
+            commands // self._batch_loads(mapping, _FL_DIMS, self.weight_batch),
+            1,
+        )
+        rows = mapping.loop_partitionings[le.IC][0]
+        cols = mapping.loop_partitionings[le.OC][0]
+        skew = 2 * rows + cols - 1
+        skew += (
+            startup["array_forward_cycles"]
+            + startup["accumulation_forward_cycles"]
+            - 1
+        )
+        beats = math.ceil(self.output_dtype_width * cols / self.sram_bandwidth)
+        if self.has_tail:
+            beats = max(beats, math.ceil(cols / self.vector_lanes))
+        result = refill_timing(
+            self._refill_tiles(mapping),
+            commands,
+            2 if self.double_buffered_l2 else 1,
+            membership,
+            periods,
+            skew,
+            matrix_parameter_cycles(
+                self.input_dtype_width, self.weight_dtype_width
+            ),
+            tuple(startup[r + "_buffer_forward_cycles"] for r in roles[:2]),
+            tuple(startup[r + "_buffer_read_cycles"] for r in roles[:2]),
+            beats,
+            profile,
+            self.has_tail,
+            transfers,
+        )
+        return result.cycles
+
+    def command_runtime(self, mapping, bank_groups, loads, store, commands):
+        transfers = CommandTransfers(
+            tuple(
+                (math.ceil(cycles), commands // count if count > 1 else 0)
+                for cycles, count in loads
+            ),
+            math.ceil(store),
+        )
+        if self.dram_untimed:
+            transfers = None
+        return self._refill_runtime(mapping, bank_groups, transfers)
+
     def matrix_cycles(self, mapping, bank_groups):
         """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
         each costing the busier of the matrix unit -- its systolic passes,
@@ -383,8 +641,8 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         every-round buffers (``_tail_stall``) -- and, for an outlier GEMM,
         the SpMM unit, which must deliver the block's sparse correction
         before the vector pipeline releases any of its rows: per 64-column
-        pass it walks every row of the block, paying ``SPMM_ROW_CYCLES`` of
-        turnaround plus that row's outliers, each gather a bank switch when
+        pass it walks every row of the block, paying the recorded row
+        overhead plus that row's outliers, each gather a bank switch when
         the weight tile spans several banks -- plus the once-per-sweep
         overhead (buffer fill, systolic skew, the last parked tile's drain)
         spread over the ops a double-buffered L2 overlaps it with.  Also
@@ -395,6 +653,9 @@ class RuntimeCalculator(BaseRuntimeCalculator):
             bank_groups: Its bank partition as role sets (``bank_partition``),
                 or ``None`` when nothing shares a bank.
         """
+        refined = self._refill_runtime(mapping, bank_groups, None)
+        if refined is not None:
+            return refined / (self._l3_blocks(mapping) * self.batch)
         blockings = mapping.loop_blockings
         orders = mapping.loop_orders
         partitionings = mapping.loop_partitionings
@@ -452,39 +713,31 @@ class RuntimeCalculator(BaseRuntimeCalculator):
                     ),
                 )
 
-        # Without a bank to park the finished tile in, its vectors leave the
-        # array one per step during the last reduction pass of each weight
-        # tile -- as one burst of the whole tile when the OC passes are
-        # adjacent (no filter loops at L1), else as OC1 bursts of one spatial
-        # tile -- and the tail drains them at ``vector_beats`` apiece.  The
-        # path absorbs ``OUTPUT_SLACK`` of them; past that the array runs at
-        # the tail's pace for the rest of the burst.  A double-buffered
-        # accumulator parks a tile whose tail moves more than a bus word per
-        # vector on some port (the toolchain's ``should_use_direct_path``);
-        # a narrower tail rides the pass and pays like a single-buffered one.
+        if self._vector_output(mapping) and self.vector_lanes:
+            vector_beats = max(
+                vector_beats, math.ceil(oc_dim / self.vector_lanes)
+            )
+
+        # A wide output parks in an accumulation bank when one is available
+        # (MatrixOps::should_use_direct_path). Streaming output instead uses
+        # the final-output FIFO; its occupancy persists across loop iterations.
         parked = self.double_buffered_accum_buffer
         if parked:
             widths = [output_width * oc_dim]
-            for dims, bits in self.tail_specs:
-                widths.append(bits * (oc_dim if le.OC in dims else 1))
+            if num_k == 1 and not self.single_k_tail_extra_pass:
+                for dims, bits in self.tail_specs:
+                    widths.append(bits * (oc_dim if le.OC in dims else 1))
             parked = max(widths) > self.sram_bandwidth
-        if not parked:
-            burst_vectors = weight_reuse_tile_size
-            burst_cycles = weight_reuse_tile_time
-            bursts = blockings[le.OC][1]
-            if blockings[le.FX][1] * blockings[le.FY][1] == 1:
-                burst_vectors *= bursts
-                burst_cycles *= bursts
-                bursts = 1
-            computation_l1_time += bursts * max(
-                0, burst_vectors * vector_beats - burst_cycles - OUTPUT_SLACK
-            )
-
         # --- L2: outer spatial-tile loop ---
         l2_blocks = 1
         for i in range(le.NUM):
             if i != le.IC:
                 l2_blocks *= blockings[i][2]
+
+        output = None
+        if not parked:
+            output = self.output_timing(mapping, vector_beats)
+            computation_l1_time = output.producer_cycles / l2_blocks
 
         # --- bus traffic of one L2 output block: the loads of its L1
         # sub-tiles, then what the vector unit moves for the block itself ---
@@ -583,18 +836,23 @@ class RuntimeCalculator(BaseRuntimeCalculator):
                     / 8
                 )
                 banks = max(1, math.ceil(weight_tile_bytes / self.bank_size))
-                switch = BANK_SWITCH_CYCLES * (1 - 1 / banks)
-            spmm_block_time = visits * SPMM_ROW_CYCLES + gathers * (1 + switch)
+                switch = self.timing_profile.soc["bank_switch_cycles"] * (
+                    1 - 1 / banks
+                )
+            spmm_block_time = visits * self.timing_profile.cycles(
+                "accelerator.spmm_row_cycles"
+            ) + gathers * (1 + switch)
             block_time = max(block_time, spmm_block_time)
 
-        # The first tile's loads overlap nothing; the last parked tile's drain
-        # is a whole vector pass, while a single-buffered accumulator's drain
-        # is already in its blocks' own time.
+        # Keep output work outstanding at the end of the sweep. Do not count
+        # it twice when the memory/SpMM resource bound already covers it.
         buffer_fill = self._bank_cycles(loads, bank_groups)
         skew = partitionings[le.IC][0] + partitionings[le.OC][0] - 2
         drain = output_size * vector_beats if parked else 0
-        overhead = buffer_fill + skew + drain
         steady = l2_blocks * block_time
+        if output is not None:
+            drain = max(0, output.consumer_cycles - steady)
+        overhead = buffer_fill + skew + drain
 
         if not self.double_buffered_l2:
             return steady + overhead

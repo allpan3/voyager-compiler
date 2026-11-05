@@ -55,6 +55,7 @@ from torch.fx.operator_schemas import normalize_function
 import interstellar
 from voyager_compiler.codegen.node_info import (
     QMAP_PARAMS,
+    is_gemm_op,
     is_nop,
     quant_param_arg_nodes,
     require_allocation,
@@ -68,7 +69,6 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
     _passed_whole,
 )
-from voyager_compiler.codegen.transform.tiling.cost import BANK_SWITCH_CYCLES
 from voyager_compiler.codegen.voyager_ir_pb2 import (
     MEMORY_LEVEL_DRAM,
     MEMORY_LEVEL_IMMEDIATE,
@@ -403,6 +403,7 @@ class _Emitter:
         self.boxes: Dict[str, Node] = {}
         # Destination-passing: producer -> {output index: destination}.
         self.dest: Dict[Node, Dict[Optional[int], TensorBoxRef]] = {}
+        self.vector_outputs: set[Node] = set()
 
     # --- references ------------------------------------------------------
 
@@ -744,8 +745,13 @@ class _Emitter:
                 f"voyager.insert(src.clone(), dst)"
             )
 
+        # Carry the store's route request onto its producer: the mapper must
+        # route that matrix output through the vector unit before memory.
+        output_via_vector = self._kwargs(node).get("output_via_vector", False)
         for producer, index in producers:
             self.dest.setdefault(producer, {})[index] = destination
+            if output_via_vector:
+                self.vector_outputs.add(producer)
 
     def _producers(self, node, gm, env, index=None):
         """The op(s) whose result this store writes, as ``[(node, index)]`` — or
@@ -816,6 +822,8 @@ class _Emitter:
             if isinstance(value, Node) and value in qmaps:
                 continue  # a qmap lookup table is not emittedan operand
             call.kwargs[key].CopyFrom(self._argument(value, env, internal))
+        if node in self.vector_outputs and is_gemm_op(node):
+            call.kwargs["output_via_vector"].scalar.bool_value = True
         return call
 
     def _kwargs(self, node) -> Dict[str, object]:
@@ -1004,6 +1012,16 @@ class _Emitter:
         op = Operation(name=node.name)
         for inner in chain:
             op.fused.op_list.append(self._call(inner, sub_env, internal))
+        # A fused vector tail already uses the vector output. An outlined
+        # bare matrix op still needs the store's explicit routing request.
+        if (
+            node in self.vector_outputs
+            and len(chain) == 1
+            and is_gemm_op(chain[0])
+        ):
+            op.fused.op_list[0].kwargs[
+                "output_via_vector"
+            ].scalar.bool_value = True
         self._set_outputs(op, node, env)
         if "interstellar_tiling" in node.meta:
             op.tiling.CopyFrom(_build_tiling(node))
@@ -1257,7 +1275,9 @@ def gen_memory_config(config) -> MemoryConfig:
         raise ValueError("Invalid DRAM timing or compiler frequency")
     untimed = math.isinf(bandwidth) and latency == 0
     return MemoryConfig(
-        bank_switch_cycles=BANK_SWITCH_CYCLES if banked else 0,
+        bank_switch_cycles=(
+            config.timing.soc["bank_switch_cycles"] if banked else 0
+        ),
         dram_mode=MemoryConfig.UNTIMED if untimed else MemoryConfig.TIMED,
         dram_bytes_per_cycle=bandwidth,
         dram_access_latency_cycles=latency,

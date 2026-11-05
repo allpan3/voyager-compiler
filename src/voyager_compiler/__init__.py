@@ -272,6 +272,8 @@ def transform(
     # A null config (no hardware) skips padding and tiling.
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
+    if config.pe_array_size is not None:
+        config.timing
 
     if not keep_fp32:
         remove_fp32_casts(model)
@@ -356,6 +358,8 @@ def compile(
     """
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
+    if config.pe_array_size is not None:
+        config.timing
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -387,6 +391,10 @@ def compile(
         f.write(print_layer_table(model, params, to_string=True))
     with open(os.path.join(output_dir, "memory_config.txt"), "w") as f:
         f.write(text_format.MessageToString(gen_memory_config(config)))
+
+    if config.timing_profile is not None:
+        with open(os.path.join(output_dir, "timing_profile.json"), "w") as f:
+            f.write(config.timing.document)
 
     flush_tensor_files()
     return params

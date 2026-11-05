@@ -32,37 +32,29 @@ from voyager_compiler.codegen.transform.tiling.timing.transfer import (
 le = interstellar.le
 REDUCTIONS = ("IC", "FX", "FY")
 
+# CIMProcessor::set_scoreboard updates the resident-set state at a clock
+# edge. Both the loader and MAC issuer see the new ownership on the next
+# edge. Extra synthesized control latency needs a separate measurement.
+RESIDENT_SET_TRANSITION_CYCLES = 1
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, kw_only=True)
 class TimingOptions(OutputOptions):
-    """Interface timing assumptions for standalone CIM estimates."""
+    """Recorded interface timing for CIM estimates, in cycles."""
 
-    memory_request_latency: int = 0
-    output_cycles_per_vector: int = 1
-    # Zero leaves SRAM feedback safety unvalidated until an HLS latency is supplied.
-    accumulation_feedback_cycles: int = 0
-    # Release to reuse and fill to first issue each pass one registered
-    # resident-set state (set_scoreboard in CIMProcessor.h). HLS pipeline
-    # stages depend on the build and are not modelled.
-    weight_release_cycles: int = 1
-    weight_ready_cycles: int = 1
+    # None leaves SRAM feedback safety unvalidated.
+    accumulation_feedback_cycles: int | None
+    output_bank_drain_cycles: int
 
     def __post_init__(self):
         super().__post_init__()
-        if (
-            type(self.output_cycles_per_vector) is not int
-            or self.output_cycles_per_vector <= 0
-        ):
-            raise ValueError(
-                "output_cycles_per_vector must be a positive integer"
-            )
         for name in (
-            "memory_request_latency",
             "accumulation_feedback_cycles",
-            "weight_release_cycles",
-            "weight_ready_cycles",
+            "output_bank_drain_cycles",
         ):
             value = getattr(self, name)
+            if name == "accumulation_feedback_cycles" and value is None:
+                continue
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
 
@@ -148,7 +140,6 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
         rc.input_dtype_width,
         port,
         rc.stride,
-        options.memory_request_latency,
         tuple(
             mapping.loop_blockings[d][level]
             for level in (1, 2)
@@ -167,7 +158,6 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             element_bits=rc.input_dtype_width,
             port_bits=port,
             pack=input_pack,
-            request_latency=options.memory_request_latency,
         )
         if reasons:
             return TimingEstimate(
@@ -194,9 +184,9 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
         )
     weight_pack = packing_factor(oc * rc.weight_dtype_width, port, l1["OC"])
     weight_bits = oc * rc.weight_dtype_width * weight_pack
-    weight_row_cycles = transfer_cycles(
-        weight_bits, port, options.memory_request_latency
-    )
+    # Fetchers issue at II=1. Payload beats and bank switches determine
+    # service time; there is no extra per-request stall allowance.
+    weight_row_cycles = transfer_cycles(weight_bits, port)
     spans = config.cim_output_axis_tiles // config.cim_b_port_tiles
     first_weight, steady_fill_cycles = stream_fill(
         ic, weight_row_cycles, ic, spans
@@ -270,7 +260,7 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             if isinstance(role, tuple):
                 output_words[role] += cycles
     output_cycles_per_vector = max(
-        options.output_cycles_per_vector,
+        1,  # The output controller loop has initiation interval one.
         ceil_div(output_width * oc, port),
         math.ceil(
             rc._bank_cycles(output_words, bank_groups) / work.output_vectors
@@ -301,11 +291,15 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             options = replace(options, output_pipeline=None)
 
     outputs = work.output_vectors
-    total_output_cycles = outputs * output_cycles_per_vector
-    total_bias_cycles = (
-        traffic.bias_external_beats
-        + bias_requests * options.memory_request_latency
+    final_vectors = (
+        prod(l1[loop] for loop in ("OX", "OY", "OC")) if banked else 1
     )
+    output_tiles = outputs // final_vectors if banked else 0
+    bank_drain = options.output_bank_drain_cycles if banked else 0
+    total_output_cycles = (
+        outputs * output_cycles_per_vector + output_tiles * bank_drain
+    )
+    total_bias_cycles = traffic.bias_external_beats
     sram_reads = traffic.buffer_accum_reads + traffic.buffer_output_reads
     sram_writes = (
         traffic.buffer_accum_intermediate_writes
@@ -314,7 +308,7 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
     # II=1 accumulation overlaps independent DualPortBuffer reads and writes.
     # Feedback spacing is a schedule assumption, not a hardware dependency stall.
     total_accumulation_cycles = max(work.mac_requests, sram_reads, sram_writes)
-    first_weight_ready = first_weight + options.weight_ready_cycles
+    first_weight_ready = first_weight + RESIDENT_SET_TRANSITION_CYCLES
     startup = max(inputs.first_fill_cycles, first_weight_ready)
     sequence_sets = policy.sequence_sets if policy.fits else 1
     replays = policy.compute_replays if policy.fits else 1
@@ -327,10 +321,10 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
         sequence_count,
         config.cim_weight_sets,
         weight_fill_cycles,
-        options.weight_ready_cycles,
+        RESIDENT_SET_TRANSITION_CYCLES,
         policy.macs_per_set_use * issue_interval,
         inputs.first_fill_cycles,
-        release_delay=options.weight_release_cycles,
+        release_delay=RESIDENT_SET_TRANSITION_CYCLES,
         load_start=max(0, first_weight - weight_fill_cycles),
     )
     # A stream pays its bank-switch round trips in series, so its last use
@@ -343,7 +337,7 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             + total_weight_cycles
             + weight_switch
             - first_switch["weight"]
-            + options.weight_ready_cycles
+            + RESIDENT_SET_TRANSITION_CYCLES
             + policy.macs_per_set_use * issue_interval,
         )
     weight_issue = weight_finish - startup
@@ -392,14 +386,12 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             vector_bits=oc * rc.bias_width,
             port_bits=port,
             interval=issue_interval,
-            request_latency=options.memory_request_latency,
         )
         resource_cycles["bias"] = max(total_bias_cycles, bias.producer_cycles)
     # Keep the last output vector or completed bank in the non-overlapped drain.
-    final_vectors = (
-        prod(l1[loop] for loop in ("OX", "OY", "OC")) if banked else 1
+    final_output = (
+        min(outputs, final_vectors) * output_cycles_per_vector + bank_drain
     )
-    final_output = min(outputs, final_vectors) * output_cycles_per_vector
     resource_cycles["output"] = max(0, total_output_cycles - final_output)
     output_bound = False
     output_readiness = {}
@@ -428,7 +420,7 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             2,
             work.mac_requests // blocks * issue_interval,
             0,
-            final_vectors * output_cycles_per_vector,
+            final_vectors * output_cycles_per_vector + bank_drain,
             0,
         )
         resource_cycles["output"] = max(
@@ -505,8 +497,8 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             ),
             weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
             weight_fill_cycles=weight_fill_cycles,
-            weight_ready_cycles=options.weight_ready_cycles,
-            weight_release_cycles=options.weight_release_cycles,
+            weight_ready_cycles=RESIDENT_SET_TRANSITION_CYCLES,
+            weight_release_cycles=RESIDENT_SET_TRANSITION_CYCLES,
             weight_sequence_steps=weight_steps,
             weight_serialized_bound=weight_bound,
             input_wait_cycles=max(0, input_issue - total_issue_cycles),
@@ -517,6 +509,8 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             accumulation_feedback_spacing_cycles=spacing,
             accumulation_feedback_safe=feedback_safe,
             output_bank_serialized_bound=output_bound,
+            output_bank_tiles=output_tiles,
+            output_bank_drain_cycles=bank_drain,
             result_latency_cycles=latency,
         ),
     )
