@@ -10,7 +10,8 @@ and pick ``torch.cond`` branches.  Tensor *shapes* come from the static
 For each node it overlays timing on the ``ResourceState`` (see ``scheduler``):
 compute on the systolic array, ``async_copy`` on the DRAM interface, and waits
 as zero-time control. A DPS ``insert`` writes a compute result into its buffer
-and is pure bookkeeping (skipped). An asynchronous compute is dispatched by
+and adds no separate event. Its output_via_vector marker is accounted for
+on the producing matrix operation. An asynchronous compute is dispatched by
 ``voyager.commit``, which posts its done-semaphore when it finishes -- so
 ``async_wait`` can reconcile compute the same way it does a DMA.
 
@@ -404,7 +405,8 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)
         elif t is _INSERT:
             # Destination-passing write: pure bookkeeping, zero-time -- the
-            # producing compute already carries its destination.  (An async
+            # producing compute already carries its destination and vector
+            # route (cost.op_info). (An async
             # producer posts its completion via voyager.commit's ``post``, not
             # the insert.)
             pass
