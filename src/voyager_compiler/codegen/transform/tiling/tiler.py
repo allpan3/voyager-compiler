@@ -954,7 +954,11 @@ def _prepare_search(node, tiler, constraint=None):
     )
 
     calculator = RuntimeCalculator
-    backend_args = {"timing": tiler.config.timing}
+    backend_args = {
+        "timing": tiler.config.timing,
+        "vector_lanes": tiler.config.vector_lanes,
+        "has_spmm": a_data is not None,
+    }
     if tiler.config.matrix_backend == 1:
         ic, oc = tiler.config.pe_array_size
         if layer.nifm % ic or layer.nofm % oc:

@@ -461,7 +461,7 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
         return util
     overhead = (
         max(1, len(profile))
-        * config.timing.accelerator["kernel_launch_overhead_cycles"]
+        * config.timing.cycles("accelerator.kernel_launch_overhead_cycles")
         + switch_cycles
     )
     return ideal_cycles / (ideal_cycles / util + overhead)
@@ -842,7 +842,8 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
     def passes(count, elems):
         cycles = math.ceil(math.ceil(elems / config.vector_lanes) / util)
         return count * (
-            cycles + config.timing.accelerator["kernel_launch_overhead_cycles"]
+            cycles
+            + config.timing.cycles("accelerator.kernel_launch_overhead_cycles")
         )
 
     rows, tile, out = tq, tq * tkv, tq * head_dim

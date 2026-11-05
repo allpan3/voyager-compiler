@@ -592,11 +592,6 @@ class BaseRuntimeCalculator:
         bank_groups, scratch_slots = self.bank_partition(
             architecture, layer, mapping
         )
-        matrix_cycles = self.matrix_cycles(mapping, bank_groups)
-        vector_cycles = (
-            self.vector_cycles(mapping, bank_groups) if self.has_tail else 0
-        )
-
         input_steps = self._batch_loads(mapping, _IF_DIMS, self.batch)
         weight_steps = self._batch_loads(mapping, _FL_DIMS, self.weight_batch)
 
@@ -623,6 +618,21 @@ class BaseRuntimeCalculator:
             (weight_load, weight_steps),
             *tail_dmas,
         ]
+
+        scheduled = self.command_runtime(
+            mapping,
+            bank_groups,
+            [(input_load, input_steps), (weight_load, weight_steps)],
+            store,
+            l3_blocks,
+        )
+        if scheduled is not None:
+            return scheduled
+
+        matrix_cycles = self.matrix_cycles(mapping, bank_groups)
+        vector_cycles = (
+            self.vector_cycles(mapping, bank_groups) if self.has_tail else 0
+        )
 
         if not self.double_buffered_l2:
             total_time = l3_blocks * matrix_cycles + sum(t * c for c, t in dmas)
@@ -674,6 +684,10 @@ class BaseRuntimeCalculator:
             total_time += count * max(compute, dma)
         total_time += matrix_cycles + vector_cycles + store
         return total_time
+
+    def command_runtime(self, mapping, bank_groups, loads, store, commands):
+        """Optional backend schedule joining DMA readiness to local execution."""
+        return None
 
     def bank_partition(self, architecture, layer, mapping):
         """``bank_partition`` of a scored mapping.  It reads no loop order, so
