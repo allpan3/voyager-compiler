@@ -18,13 +18,15 @@ from voyager_compiler.codegen.transform.tiling.timing.sa_output import (
     output_timing,
 )
 from voyager_compiler.codegen.transform.tiling.timing.sa_pipeline import (
-    CommandTransfers,
     OutputPattern,
     output_events,
 )
 from voyager_compiler.codegen.transform.tiling.timing.sa_refill import (
     InputTile,
     refill_timing,
+)
+from voyager_compiler.codegen.transform.tiling.timing.schedule import (
+    CommandTransfers,
 )
 
 le = interstellar.le
@@ -616,13 +618,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         return result.cycles
 
     def command_runtime(self, mapping, bank_groups, loads, store, commands):
-        transfers = CommandTransfers(
-            tuple(
-                (math.ceil(cycles), commands // count if count > 1 else 0)
-                for cycles, count in loads
-            ),
-            math.ceil(store),
-        )
+        transfers = CommandTransfers.from_loads(loads, store, commands)
         if self.dram_untimed:
             transfers = None
         return self._refill_runtime(mapping, bank_groups, transfers)

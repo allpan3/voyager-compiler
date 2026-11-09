@@ -82,3 +82,21 @@ def burst(
 # Drain queued work during producer computation that yields no completed results
 def idle(cycles):
     return StreamSummary(cycles, (cycles, float("-inf"), cycles, 0))
+
+
+def registered_fifo(interval, service, capacity):
+    """One production and dequeue through a registered Connections FIFO.
+
+    Empty storage has no combinational bypass; a full slot becomes writable
+    on the edge after its dequeue. These are source-defined clock boundaries.
+    """
+    credit = 1 - capacity * service
+    return StreamSummary(
+        interval,
+        (
+            interval,
+            credit,
+            interval + 1 + service,
+            max(service, credit + 1 + service),
+        ),
+    )

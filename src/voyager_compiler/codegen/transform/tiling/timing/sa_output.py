@@ -8,9 +8,9 @@ excluded. This is a deterministic queue estimate, not an RTL simulator.
 from dataclasses import dataclass
 from functools import lru_cache
 
-from .backpressure import StreamSummary, idle
+from .backpressure import idle, registered_fifo
+from .schedule import OUTPUT_FIFO_VECTORS
 
-OUTPUT_FIFO_VECTORS = 8  # MatrixProcessor.h: accum_output_fifo
 REDUCTIONS = {"IC", "FX", "FY"}
 
 
@@ -69,9 +69,7 @@ def output_timing(levels, array_rows, cycles_per_vector):
     # For a full FIFO, the oldest dequeue is consumer_finish - 8*service.
     # If service has gaps, producer+1 already dominates that bound.
     # p' = max(p+1, d-8*s+1); d' = max(p'+1+s, d+s).
-    summary = StreamSummary(
-        1, (1, 1 - OUTPUT_FIFO_VECTORS * service, 2 + service, service)
-    )
+    summary = registered_fifo(1, service, OUTPUT_FIFO_VECTORS)
     spatial = 1
     prefix = 0
     for loop, bound in levels[0]:

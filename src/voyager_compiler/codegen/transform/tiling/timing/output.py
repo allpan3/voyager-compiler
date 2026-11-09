@@ -4,6 +4,27 @@ from functools import lru_cache
 
 from .backpressure import burst, idle
 
+STAGE_NAMES = (
+    "matrix_output",
+    "router",
+    "stage_0",
+    "stage_1",
+    "stage_2",
+    "stage_3",
+    "vector_output",
+    "store",
+)
+TARGET_FIELDS = (
+    "array_rows",
+    "array_columns",
+    "vector_lanes",
+    "input_bits",
+    "weight_bits",
+    "accum_bits",
+    "output_bits",
+    "port_bits",
+)
+
 
 # Describe serial payload storage using elements or a named hardware capacity
 @dataclass(frozen=True)

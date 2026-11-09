@@ -11,7 +11,8 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from functools import lru_cache
 
-from .sa_pipeline import OutputPattern, OutputSchedule, PipelineEstimate
+from .sa_pipeline import OutputPattern, PipelineEstimate
+from .schedule import OutputSchedule
 
 
 @dataclass(frozen=True)
@@ -99,7 +100,14 @@ class _Banks:
 
 class _RefillSchedule(OutputSchedule):
     def __init__(self, beats, slots, skew, profile, vector, transfers):
-        super().__init__(beats, slots, skew, profile, vector, transfers)
+        super().__init__(
+            beats,
+            slots,
+            skew,
+            profile.stages if vector else (),
+            profile.direct_store_forward_cycles,
+            transfers,
+        )
         self.skew = skew
         self.banks = _Banks()
         self.output_bank = None
