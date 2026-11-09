@@ -150,6 +150,10 @@ def banked_schedule(
         ),
         handoff=profile.producer_handoff_cycles,
         pipeline=profile.stages if rc.has_tail else (),
+        readahead=(
+            profile.input_readahead_beats,
+            profile.weight_readahead_beats,
+        ),
     )
     # Independent input/weight ports and ready operands are optimistic. The
     # last completed bank must still pass through the output port and DMA.
@@ -260,6 +264,7 @@ def estimate(
     batch=True,
     pipeline=(),
     handoff=0,
+    readahead=(0, 0),
     cutoff=float("inf"),
 ):
     run = policy[2]
@@ -296,6 +301,7 @@ def estimate(
         transfers,
         tuple(pipeline),
         handoff,
+        tuple(readahead),
         cutoff,
     )
 
@@ -327,6 +333,7 @@ def _estimate(
     transfers,
     pipeline,
     handoff,
+    readahead,
     cutoff,
 ):
     command_size = size
@@ -403,6 +410,20 @@ def _estimate(
         order += 1
         heappush(events, (at, order, kind, index))
 
+    def claim(role, slot):
+        # A load that read ahead takes the slot as it frees. Its buffered
+        # beats enter storage only now, so readiness cannot precede a fresh
+        # fill from this edge; read-ahead saves only shared-port service.
+        job = jobs[role]
+        if job is not None and job[3] is not None and job[1] % len(free[role]) == slot:
+            free[role][slot] = False
+            job[3] = None
+            job[2] = max(
+                job[2],
+                now
+                + (first[role] if job[1] % per_command[role] == 0 else fill[role]),
+            )
+
     event(dma.dispatch(), 6, 0)
     while (
         compute < size
@@ -425,6 +446,7 @@ def _estimate(
                 if ((t + 1) * tile_steps - 1) == index:
                     free[0][t % 2] = True
                     ready[0].remove(t)
+                    claim(0, t % 2)
                 if ((o + 1) * output_steps - 1) == index:
                     accum_free[o % 2] = False
                     event(now + latency, 3, o)
@@ -442,6 +464,7 @@ def _estimate(
             elif kind == 5:
                 free[1][index % capacity] = True
                 ready[1].remove(index)
+                claim(1, index % capacity)
             else:
                 dispatched = index
                 waiting = index - (slots - 1)
@@ -580,7 +603,9 @@ def _estimate(
                 tuple(accum_free),
                 tuple(next_load[r] - bases[r] for r in (0, 1)),
                 tuple(
-                    (j[0], j[1] - bases[r], max(0, j[2] - now)) if j else None
+                    (j[0], j[1] - bases[r], max(0, j[2] - now), j[3])
+                    if j
+                    else None
                     for r, j in enumerate(jobs)
                 ),
                 tuple(
@@ -627,7 +652,9 @@ def _estimate(
                     ]
                     next_load = [v + shifts[r] for r, v in enumerate(next_load)]
                     jobs = [
-                        [j[0], j[1] + shifts[r], j[2] + delta] if j else None
+                        [j[0], j[1] + shifts[r], j[2] + delta, j[3]]
+                        if j
+                        else None
                         for r, j in enumerate(jobs)
                     ]
                     events = [
@@ -654,7 +681,7 @@ def _estimate(
                     continue
             else:
                 seen[state] = (compute, now, bases)
-        if batch and pipeline:
+        if batch and pipeline and not any(j and j[3] is not None for j in jobs):
             # Within a fixed tile, skip complete repeated service rotations.
             # Stop before every compute, load, tile or command boundary.
             stream_state = (
@@ -708,21 +735,29 @@ def _estimate(
                 jobs[role] is None
                 and index < counts[role]
                 and index // per_command[role] <= dispatched
-                and free[role][index % len(free[role])]
             ):
-                stage_seen.clear()
-                free[role][index % len(free[role])] = False
-                jobs[role] = [
-                    reads[role],
-                    index,
-                    now
-                    + (
-                        first[role]
-                        if index % per_command[role] == 0
-                        else fill[role]
-                    ),
-                ]
-                next_load[role] += 1
+                slot = index % len(free[role])
+                # An occupied slot admits only the controller's own read-ahead;
+                # the final beat always waits for the slot (see claim).
+                ahead = None if free[role][slot] else min(
+                    readahead[role], reads[role] - 1
+                )
+                if ahead is None or ahead > 0:
+                    stage_seen.clear()
+                    if ahead is None:
+                        free[role][slot] = False
+                    jobs[role] = [
+                        reads[role],
+                        index,
+                        now
+                        + (
+                            first[role]
+                            if index % per_command[role] == 0
+                            else fill[role]
+                        ),
+                        ahead,
+                    ]
+                    next_load[role] += 1
         if pipeline:
             # A source vector belongs to its accumulation tile until the
             # matrix-to-vector handshake, independently of its later store.
@@ -730,7 +765,7 @@ def _estimate(
             space = [len(q) < stage[0] for q, stage in zip(queues, pipeline)]
             if jobs[2] is None and queues[-1] and queues[-1][0] <= now:
                 queues[-1].popleft()
-                jobs[2] = [beats, consumed // final_vectors, 0]
+                jobs[2] = [beats, consumed // final_vectors, 0, None]
             for st in range(len(queues) - 1, 0, -1):
                 if space[st] and queues[st - 1] and queues[st - 1][0] <= now:
                     # The vector instruction for the next command cannot
@@ -754,7 +789,7 @@ def _estimate(
                     event(now + drain, 4, index)
                     source_ready = now + drain + 1
         elif jobs[2] is None and out_queue:
-            jobs[2] = [final_vectors * beats, out_queue[0], 0]
+            jobs[2] = [final_vectors * beats, out_queue[0], 0, None]
         if not computing and compute < size:
             t, w, o = coordinates(compute)
             if (
@@ -776,7 +811,11 @@ def _estimate(
                 )
                 event(compute_finish, 2, compute)
         active = {
-            g: [r for r, j in enumerate(jobs) if j and bank(r, j[1]) == g]
+            g: [
+                r
+                for r, j in enumerate(jobs)
+                if j and bank(r, j[1]) == g and j[3] != 0
+            ]
             for g in cursor
         }
         ordered = {
@@ -784,9 +823,13 @@ def _estimate(
             for g, rs in active.items()
             if rs
         }
+        # Stop when a job finishes its words or exhausts its read-ahead.
         width = min(
             (
-                len(rs) * (jobs[r][0] - 1) + pos + 1
+                len(rs)
+                * ((jobs[r][0] if jobs[r][3] is None else jobs[r][3]) - 1)
+                + pos
+                + 1
                 for rs in ordered.values()
                 for pos, r in enumerate(rs)
             ),
@@ -820,12 +863,15 @@ def _estimate(
         for g, rs in ordered.items():
             turns, extra = divmod(span, len(rs))
             for pos, r in enumerate(rs):
-                jobs[r][0] -= turns + (pos < extra)
+                served = turns + (pos < extra)
+                jobs[r][0] -= served
+                if jobs[r][3] is not None:
+                    jobs[r][3] -= served
             cursor[g] = (rs[(span - 1) % len(rs)] + 1) % 3
         now += span
         for r in range(3):
             if jobs[r] is not None and jobs[r][0] == 0:
-                _, index, ready_at = jobs[r]
+                index, ready_at = jobs[r][1], jobs[r][2]
                 jobs[r] = None
                 if r < 2:
                     stage_seen.clear()

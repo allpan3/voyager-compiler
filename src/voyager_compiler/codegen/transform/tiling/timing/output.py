@@ -224,12 +224,19 @@ def output_timing(
 
 @dataclass(frozen=True)
 class BankedOutputPipeline:
-    """Measured CIM bank handoff and the downstream vector pipeline."""
+    """Measured CIM timing used by the banked schedule.
+
+    Covers the bank handoff, the downstream vector pipeline, and the operand
+    beats each controller accepts before its buffer slot frees (read-ahead).
+    Read-ahead counts only accelerator storage, not system response queues.
+    """
 
     target: tuple
     stages: tuple
     producer_handoff_cycles: int
     forward_cycles: int
+    input_readahead_beats: int
+    weight_readahead_beats: int
 
     @classmethod
     def from_dict(cls, value):
@@ -238,9 +245,12 @@ class BankedOutputPipeline:
             "stages",
             "producer_handoff_cycles",
             "forward_cycles",
+            "input_readahead_beats",
+            "weight_readahead_beats",
         }:
             raise ValueError(
-                "Banked timing requires target, stages and handoff/forward delays"
+                "Banked timing requires target, stages, handoff/forward delays "
+                "and operand read-ahead"
             )
         target = value["target"]
         if not isinstance(target, dict) or set(target) != set(TARGET_FIELDS):
@@ -270,10 +280,16 @@ class BankedOutputPipeline:
                     "Stage capacities and delays must be positive integers"
                 )
             records.append(pair)
-        delays = value["producer_handoff_cycles"], value["forward_cycles"]
+        delays = (
+            value["producer_handoff_cycles"],
+            value["forward_cycles"],
+            value["input_readahead_beats"],
+            value["weight_readahead_beats"],
+        )
         if any(type(v) is not int or v < 0 for v in delays):
             raise ValueError(
-                "Bank handoff and forwarding delays must be nonnegative integers"
+                "Bank handoff, forwarding and read-ahead values must be "
+                "nonnegative integers"
             )
         return cls(
             tuple(target[k] for k in TARGET_FIELDS), tuple(records), *delays
