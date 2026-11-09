@@ -1,4 +1,4 @@
-"""Shared finite-storage scheduling rules.
+"""Shared finite-storage and command scheduling rules.
 
 Backends supply ordered work, storage lifetimes and build-specific stage delays.
 Repeated work skips only when its complete relative timing state repeats.
@@ -6,6 +6,7 @@ Repeated work skips only when its complete relative timing state repeats.
 
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from math import ceil
 
 # MatrixProcessor and CIMProcessor both use an eight-vector Connections FIFO.
@@ -91,7 +92,44 @@ class Transfers:
         return max(self.dma, self.now, done) + self.spec.store
 
 
-class OutputSchedule:
+class _RepeatedSchedule:
+    def repeat(self, count, body, vectors, commands=False, stride=1):
+        """Skip only after an identical relative state recurs at this phase.
+
+        The same loop body from the same relative state must produce the
+        same next state and elapsed time. Repeating that transition advances
+        all retained timestamps by its elapsed time; no average-rate or
+        convergence tolerance is involved. Transients execute normally.
+        """
+        if count == 1:
+            body()
+            return
+        seen = {}
+        index = 0
+        while index < count:
+            if index % stride == 0:
+                state = self.state(commands)
+                prior = seen.get(state)
+                if prior is not None:
+                    old_index, old_time = prior
+                    period = index - old_index
+                    repeats = (count - index) // period
+                    if repeats:
+                        self.advance(
+                            (self.producer - old_time) * repeats,
+                            vectors * period * repeats,
+                            commands,
+                            period * repeats,
+                        )
+                        index += period * repeats
+                        continue
+                else:
+                    seen[state] = index, self.producer
+            body()
+            index += 1
+
+
+class OutputSchedule(_RepeatedSchedule):
     """Timing state at a loop boundary, shared by direct and vector routes."""
 
     def __init__(
@@ -187,41 +225,6 @@ class OutputSchedule:
         elif self.vector:
             self.gate += vectors
 
-    def repeat(self, count, body, vectors, commands=False, stride=1):
-        """Skip only after an identical relative state recurs at this phase.
-
-        The same loop body from the same relative state must produce the
-        same next state and elapsed time. Repeating that transition advances
-        all retained timestamps by its elapsed time; no average-rate or
-        convergence tolerance is involved. Transients execute normally.
-        """
-        if count == 1:
-            body()
-            return
-        seen = {}
-        index = 0
-        while index < count:
-            if index % stride == 0:
-                state = self.state(commands)
-                prior = seen.get(state)
-                if prior is not None:
-                    old_index, old_time = prior
-                    period = index - old_index
-                    repeats = (count - index) // period
-                    if repeats:
-                        self.advance(
-                            (self.producer - old_time) * repeats,
-                            vectors * period * repeats,
-                            commands,
-                            period * repeats,
-                        )
-                        index += period * repeats
-                        continue
-                else:
-                    seen[state] = index, self.producer
-            body()
-            index += 1
-
     def pattern(self, pattern):
         def body():
             self.producer += pattern.gap
@@ -235,3 +238,62 @@ class OutputSchedule:
         # state for every vector in a long uniform burst.
         stride = 1 if pattern.child else self.histories[0].maxlen
         self.repeat(pattern.repeat, body, vectors, stride=stride)
+
+
+class _CommandSchedule(_RepeatedSchedule):
+    def __init__(self, transfers, slots):
+        self.producer = 0
+        self.finished = deque(maxlen=slots)
+        self.transfers = Transfers(transfers, slots)
+
+    def state(self, commands=False):
+        return (
+            tuple(t - self.producer for t in self.finished),
+            self.transfers.state(self.producer),
+        )
+
+    def advance(self, cycles, vectors, commands=False, count=0):
+        self.producer += cycles
+        self.finished = deque(
+            (t + cycles for t in self.finished), maxlen=self.finished.maxlen
+        )
+        self.transfers.advance(cycles, count)
+
+
+@lru_cache(maxsize=256)
+def command_timing(command_cycles, commands, slots, transfers):
+    """Apply compiler dispatch and retirement to an architectural command cost.
+
+    Local execution is represented by its command duration. DMA and command
+    slot dependencies use the same rules as the characterized stage schedule.
+    This does not infer overlap between uncharacterized matrix commands.
+    """
+    if transfers is None:
+        return commands * command_cycles
+    if all(period in (0, 1) for _, period in transfers.loads):
+        # Prologue, first prefetch, repeated load/store overlap, and epilogue
+        # of the same compiler sequence. No state walk is needed here.
+        held = sum(c for c, p in transfers.loads if p == 0)
+        load = sum(c for c, p in transfers.loads if p == 1)
+        store = transfers.store
+        if slots == 1 or commands == 1:
+            return held + commands * (load + command_cycles + store)
+        return (
+            held
+            + load
+            + max(command_cycles, load)
+            + (commands - 2) * max(command_cycles, load + store)
+            + max(command_cycles, store)
+            + store
+        )
+    state = _CommandSchedule(transfers, slots)
+
+    def command():
+        state.producer = (
+            max(state.producer, state.transfers.dispatch()) + command_cycles
+        )
+        state.finished.append(state.producer)
+        state.transfers.retire(state.finished)
+
+    state.repeat(commands, command, 0, commands=True)
+    return state.transfers.finish(state.producer)

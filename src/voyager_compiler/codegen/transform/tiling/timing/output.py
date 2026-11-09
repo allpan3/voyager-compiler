@@ -2,7 +2,7 @@
 from dataclasses import dataclass, replace
 from functools import lru_cache
 
-from .backpressure import burst, idle
+from .backpressure import burst, idle, registered_fifo
 
 STAGE_NAMES = (
     "matrix_output",
@@ -133,13 +133,18 @@ def completion_timing(
     prefix_at=None,
     prefix_cycles=0,
     credit_delay_cycles=0,
+    registered=False,
 ):
-    summary = burst(
-        1,
-        interval,
-        cycles_per_vector,
-        capacity_vectors,
-        credit_delay_cycles=credit_delay_cycles,
+    summary = (
+        registered_fifo(interval, cycles_per_vector, capacity_vectors)
+        if registered
+        else burst(
+            1,
+            interval,
+            cycles_per_vector,
+            capacity_vectors,
+            credit_delay_cycles=credit_delay_cycles,
+        )
     )
     for index, (loop, bound) in enumerate(loops):
         if index == prefix_at:
@@ -192,6 +197,7 @@ def output_timing(
         prefix_at,
         prefix_cycles,
         forward + feedback,
+        registered=profile is None,
     )
     # Add forward transit once to the final completion time
     result = replace(
@@ -214,3 +220,61 @@ def output_timing(
         ),
         output_storage_elements=storage,
     )
+
+
+@dataclass(frozen=True)
+class BankedOutputPipeline:
+    """Measured CIM bank handoff and the downstream vector pipeline."""
+
+    target: tuple
+    stages: tuple
+    producer_handoff_cycles: int
+    forward_cycles: int
+
+    @classmethod
+    def from_dict(cls, value):
+        if not isinstance(value, dict) or set(value) != {
+            "target",
+            "stages",
+            "producer_handoff_cycles",
+            "forward_cycles",
+        }:
+            raise ValueError(
+                "Banked timing requires target, stages and handoff/forward delays"
+            )
+        target = value["target"]
+        if not isinstance(target, dict) or set(target) != set(TARGET_FIELDS):
+            raise ValueError(
+                "Banked timing target must specify geometry and widths"
+            )
+        if any(type(v) is not int or v <= 0 for v in target.values()):
+            raise ValueError(
+                "Banked timing geometry and widths must be positive integers"
+            )
+        stages = value["stages"]
+        if not isinstance(stages, list) or len(stages) != len(STAGE_NAMES):
+            raise ValueError(
+                "Banked timing requires the eight ordered vector stages"
+            )
+        records = []
+        for name, stage in zip(STAGE_NAMES, stages):
+            if (
+                not isinstance(stage, dict)
+                or set(stage) != {"name", "capacity_vectors", "forward_cycles"}
+                or stage["name"] != name
+            ):
+                raise ValueError(f"Expected banked output stage {name}")
+            pair = stage["capacity_vectors"], stage["forward_cycles"]
+            if any(type(v) is not int or v <= 0 for v in pair):
+                raise ValueError(
+                    "Stage capacities and delays must be positive integers"
+                )
+            records.append(pair)
+        delays = value["producer_handoff_cycles"], value["forward_cycles"]
+        if any(type(v) is not int or v < 0 for v in delays):
+            raise ValueError(
+                "Bank handoff and forwarding delays must be nonnegative integers"
+            )
+        return cls(
+            tuple(target[k] for k in TARGET_FIELDS), tuple(records), *delays
+        )

@@ -511,7 +511,9 @@ class BaseRuntimeCalculator:
         per_step = self._l3_loads(mapping, dims) if dims else 1
         return per_step * (self.batch if per_step > 1 else distinct)
 
-    def calculate_runtime(self, architecture, layer, mapping):
+    def calculate_runtime(
+        self, architecture, layer, mapping, *, command_runtime=None
+    ):
         if self.input_buffer_size is not None:
             _, reasons = input_buffer_usage(
                 mapping, self.stride, self.input_buffer_size
@@ -619,7 +621,7 @@ class BaseRuntimeCalculator:
             *tail_dmas,
         ]
 
-        scheduled = self.command_runtime(
+        scheduled = (command_runtime or self.command_runtime)(
             mapping,
             bank_groups,
             [(input_load, input_steps), (weight_load, weight_steps)],

@@ -8,6 +8,7 @@ describe one L2 command (one step of the compiler's L3 grid).
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from math import prod
 
 import interstellar
@@ -20,6 +21,14 @@ from voyager_compiler.codegen.transform.tiling.cost import (
 from voyager_compiler.codegen.transform.tiling.input import input_buffer_usage
 from voyager_compiler.codegen.transform.tiling.runtime import (
     BaseRuntimeCalculator,
+)
+from voyager_compiler.codegen.transform.tiling.timing.cim_schedule import (
+    banked_profile,
+    banked_schedule,
+)
+from voyager_compiler.codegen.transform.tiling.timing.schedule import (
+    CommandTransfers,
+    command_timing,
 )
 
 le = interstellar.le
@@ -455,9 +464,9 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
 
     Weight and input prefetch overlap MAC issue, subject to resident-set and
     buffer availability. Partial sums beyond the local register capacity
-    incur SRAM reads and writes. Interacting operand and output waits use an
-    additive bound, retaining queued output work. The estimate ranks mappings
-    without modeling command serialization or unprofiled HLS pipeline stages.
+    incur SRAM reads and writes. Characterized banked paths join operand,
+    accumulation and output ownership with compiler dispatch and DMA. Other
+    paths retain resource bounds; unprofiled HLS stages are not inferred.
     """
 
     def __init__(self, *args, config, layer, timing_options=None, **kwargs):
@@ -469,6 +478,7 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
             if timing_options is None
             else timing_options
         )
+        self._banked_pipeline = banked_profile(self)
         self._input_cache = {}
         # The bank partition and the vector cycles read no loop order; the
         # evaluation and the matrix timing read no L3 order.
@@ -645,10 +655,34 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
             banked_output=self.uses_banked_output(mapping),
         )
 
-    def calculate_runtime(self, architecture, layer, mapping):
+    def calculate_runtime(
+        self, architecture, layer, mapping, *, runtime_limit=math.inf
+    ):
         if not self.evaluate(mapping).legal:
             return math.inf
-        return super().calculate_runtime(architecture, layer, mapping)
+        return super().calculate_runtime(
+            architecture,
+            layer,
+            mapping,
+            command_runtime=partial(
+                self.command_runtime, runtime_limit=runtime_limit
+            ),
+        )
+
+    @property
+    def seed_runtime(self):
+        # Do not double the search for a layer that cannot use the joint model.
+        return self._seed_runtime if self._banked_pipeline is not None else None
+
+    def _seed_runtime(self, architecture, layer, mapping):
+        if not self.evaluate(mapping).legal:
+            return math.inf
+        return super().calculate_runtime(
+            architecture,
+            layer,
+            mapping,
+            command_runtime=self._aggregate_command_runtime,
+        )
 
     def timing(self, mapping, bank_groups=None):
         """Return command timing and traffic, or None for an illegal mapping."""
@@ -663,7 +697,56 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
             issue_window(self.config, self.input_dtype_width),
         )
 
+    def command_runtime(
+        self,
+        mapping,
+        bank_groups,
+        loads,
+        store,
+        commands,
+        *,
+        runtime_limit=math.inf,
+    ):
+        result = banked_schedule(
+            self, mapping, bank_groups, loads, store, commands, runtime_limit
+        )
+        if result is not None:
+            return result
+        return self._aggregate_command_runtime(
+            mapping, bank_groups, loads, store, commands
+        )
+
+    def _aggregate_command_runtime(
+        self, mapping, bank_groups, loads, store, commands
+    ):
+        # A separate tail or split reduction has additional compiler commands;
+        # keep its existing schedule until those commands are described here.
+        if (
+            mapping.loop_blockings[le.IC][3] != 1
+            or self.single_k_tail_extra_pass
+            or self.tail_specs
+        ):
+            return None
+        cycles = self._aggregate_matrix_cycles(mapping, bank_groups)
+        if not math.isfinite(cycles):
+            return cycles
+        transfers = None
+        if not self.dram_untimed:
+            transfers = CommandTransfers.from_loads(loads, store, commands)
+        return command_timing(
+            cycles, commands, 2 if self.double_buffered_l2 else 1, transfers
+        )
+
     def matrix_cycles(self, mapping, bank_groups):
+        # Reporting prices one command with the same local dependencies.
+        result = banked_schedule(
+            self, mapping, bank_groups, ((0, 1), (0, 1)), 0, 1
+        )
+        if result is not None:
+            return result
+        return self._aggregate_matrix_cycles(mapping, bank_groups)
+
+    def _aggregate_matrix_cycles(self, mapping, bank_groups):
         return self._matrix_cycles.get(
             (_matrix_key(mapping), bank_groups),
             self._matrix_timing_cycles,

@@ -1036,16 +1036,41 @@ def _run_search(search):
         RuntimeError: No tiling fits on chip.
     """
     search.layer.size_fn = search.size_fn
-    try:
-        result = interstellar.optimizer.opt_optimizer(
+
+    def optimize(runtime):
+        return interstellar.optimizer.opt_optimizer(
             search.tiler.arch,
             search.layer,
             search.tiler.schedule,
-            search.rc.calculate_runtime,
+            runtime,
             verbose=False,
             runtime_tolerance=search.tiler.runtime_tolerance,
             order_key=search.rc.order_key,
         )
+
+    try:
+        exact_runtime = search.rc.calculate_runtime
+        seed_runtime = getattr(search.rc, "seed_runtime", None)
+        if seed_runtime is not None:
+            # The cheap pass supplies only an incumbent. Every surviving
+            # candidate is ranked with the full model, including all ties.
+            seed = optimize(seed_runtime)
+            fastest = exact_runtime(search.tiler.arch, search.layer, seed[2])
+
+            def runtime(architecture, layer, mapping):
+                nonlocal fastest
+                value = exact_runtime(
+                    architecture,
+                    layer,
+                    mapping,
+                    runtime_limit=fastest
+                    * (1.0 + search.tiler.runtime_tolerance),
+                )
+                fastest = min(fastest, value)
+                return value
+        else:
+            runtime = exact_runtime
+        result = optimize(runtime)
     except AssertionError as e:
         # The optimizer reports "nothing fits" with a bare assert, so match
         # it narrowly: every other AssertionError in interstellar is a real

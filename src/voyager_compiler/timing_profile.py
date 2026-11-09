@@ -97,7 +97,16 @@ class TimingProfile:
                 "omit both to use architectural timing"
             )
         if "cim" in optional:
-            _keys(data["accelerator"]["cim"], CIM_FIELDS, "accelerator.cim")
+            _keys(
+                data["accelerator"]["cim"],
+                CIM_FIELDS
+                | (
+                    {"banked_pipeline"}
+                    if "banked_pipeline" in data["accelerator"]["cim"]
+                    else set()
+                ),
+                "accelerator.cim",
+            )
         _keys(data["soc"], SOC_FIELDS, "soc")
         if not isinstance(data["soc"]["name"], str) or not data["soc"]["name"]:
             raise ValueError("A timing profile needs a SoC name")
@@ -116,8 +125,10 @@ class TimingProfile:
             {f"soc.{k}": v for k, v in data["soc"].items() if k != "name"}
         )
         for name, value in values.items():
-            if name.endswith(("output_pipeline", "input_pipeline")):
-                continue  # The existing OutputPipeline type validates this object below.
+            if name.endswith(
+                ("output_pipeline", "input_pipeline", "banked_pipeline")
+            ):
+                continue  # Pipeline types validate these records below.
             if value is None and name != "soc.bank_switch_cycles":
                 continue  # These consumers explicitly report unknown delays.
             minimum = 1 if name.endswith("accumulation_feedback_cycles") else 0
@@ -165,9 +176,13 @@ class TimingProfile:
                         "SA input delays must be nonnegative integers"
                     )
             from voyager_compiler.codegen.transform.tiling.timing.output import (
+                BankedOutputPipeline,
                 OutputOptions,
             )
 
+            banked = result.accelerator.get("cim", {}).get("banked_pipeline")
+            if banked is not None:
+                BankedOutputPipeline.from_dict(banked)
             pipeline = OutputOptions(
                 output_pipeline=result.accelerator.get("cim", {}).get(
                     "output_pipeline"

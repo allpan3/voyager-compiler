@@ -1,9 +1,9 @@
 """CIM command timing from controller traffic and loop order.
 
-Operand buffers, resident weight sets, and output storage are priced with
-closed formulas. When waits interact, add their costs and the output backlog
-conservatively rather than walking the loop nest. DRAM timing remains in the
-shared runtime calculator.
+Architectural formulas describe operand traffic, resident weight lifetimes,
+and output work. Characterized banked paths schedule their dependencies and
+DMA together in ``timing.cim_schedule``; other paths retain conservative
+resource bounds.
 """
 
 import math
@@ -15,12 +15,19 @@ from voyager_compiler.codegen.transform.tiling.timing.bias import bias_timing
 from voyager_compiler.codegen.transform.tiling.timing.buffers import (
     buffer_completion,
 )
+from voyager_compiler.codegen.transform.tiling.timing.cim_schedule import (
+    mapping_levels,
+)
 from voyager_compiler.codegen.transform.tiling.timing.input import (
     input_bank_traffic,
 )
 from voyager_compiler.codegen.transform.tiling.timing.output import (
+    BankedOutputPipeline,
     OutputOptions,
     output_timing,
+)
+from voyager_compiler.codegen.transform.tiling.timing.schedule import (
+    OUTPUT_FIFO_VECTORS,
 )
 from voyager_compiler.codegen.transform.tiling.timing.transfer import (
     ceil_div,
@@ -45,9 +52,22 @@ class TimingOptions(OutputOptions):
     # None leaves SRAM feedback safety unvalidated.
     accumulation_feedback_cycles: int | None
     output_bank_drain_cycles: int
+    banked_pipeline: BankedOutputPipeline | None = None
 
     def __post_init__(self):
         super().__post_init__()
+        if isinstance(self.banked_pipeline, dict):
+            object.__setattr__(
+                self,
+                "banked_pipeline",
+                BankedOutputPipeline.from_dict(self.banked_pipeline),
+            )
+        if self.banked_pipeline is not None and not isinstance(
+            self.banked_pipeline, BankedOutputPipeline
+        ):
+            raise ValueError(
+                "banked_pipeline must contain measured bank/output timing"
+            )
         for name in (
             "accumulation_feedback_cycles",
             "output_bank_drain_cycles",
@@ -92,20 +112,6 @@ class TimingEstimate:
     readiness: dict = field(default_factory=dict)
 
 
-def _levels(mapping):
-    """L1 and L2 bounds in inner-to-outer order, excluding the unit batch loop."""
-    return tuple(
-        tuple(
-            (le.table[d], mapping.loop_blockings[d][level])
-            for d in sorted(
-                (d for d in range(le.NUM) if d != le.ON),
-                key=lambda d: mapping.loop_orders[d][level],
-            )
-        )
-        for level in (1, 2)
-    )
-
-
 # Count intervening output updates before the innermost active reduction advances.
 def feedback_spacing(levels):
     spacing = 1
@@ -120,7 +126,7 @@ def feedback_spacing(levels):
 def estimate_cycles(rc, mapping, work, bank_groups, interval):
     """Estimate command timing for the selected operand widths and fused tail."""
     config, options = rc.config, rc.timing_options
-    levels = _levels(mapping)
+    levels = mapping_levels(mapping)
     l1, l2 = (dict(level) for level in levels)
     ic, oc = config.pe_array_size
     port = rc.sram_bandwidth
@@ -403,7 +409,10 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             levels[0] + levels[1],
             output_cycles_per_vector,
             elements_per_vector=oc,
-            output_storage={"matrix_output": oc * 8, "vector_pipeline": 0},
+            output_storage={
+                "matrix_output": oc * OUTPUT_FIFO_VECTORS,
+                "vector_pipeline": 0,
+            },
             interval=issue_interval,
             direct=not streaming_tail,
             options=options,
@@ -497,6 +506,8 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             ),
             weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
             weight_fill_cycles=weight_fill_cycles,
+            weight_first_fill_cycles=first_weight,
+            input_first_fill_cycles=inputs.first_fill_cycles,
             weight_ready_cycles=RESIDENT_SET_TRANSITION_CYCLES,
             weight_release_cycles=RESIDENT_SET_TRANSITION_CYCLES,
             weight_sequence_steps=weight_steps,
