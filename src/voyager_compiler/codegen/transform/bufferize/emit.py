@@ -37,6 +37,7 @@ non-bufferized path).  Three ideas carry the whole translation:
 """
 
 import logging
+import math
 import operator
 import os
 import signal
@@ -80,6 +81,7 @@ from voyager_compiler.codegen.voyager_ir_pb2 import (
     LevelAccessCount,
     LevelTiling,
     LoopBound,
+    MemoryConfig,
     Model,
     Operation,
     PrimOp,
@@ -1253,6 +1255,39 @@ def print_layer_table(
         return text
     print(text)
     return text
+
+
+def gen_memory_config(config) -> MemoryConfig:
+    """Generate the harness timing mode and tensor allocation geometry."""
+    banked = not config.independent_memory_ports and all(
+        (config.scratchpad_size, config.num_banks, config.bank_width)
+    )
+    if not math.isfinite(config.frequency) or config.frequency <= 0:
+        raise ValueError("Invalid compiler frequency")
+    bandwidth = config.dram_bytes_per_cycle
+    latency = config.dram_access_latency_cycles
+    if (
+        math.isnan(bandwidth)
+        or bandwidth <= 0
+        or not math.isfinite(latency)
+        or latency < 0
+    ):
+        raise ValueError("Invalid DRAM timing or compiler frequency")
+    untimed = math.isinf(bandwidth) and latency == 0
+    return MemoryConfig(
+        bank_switch_cycles=(
+            config.timing.soc["bank_switch_cycles"] if banked else 0
+        ),
+        dram_mode=MemoryConfig.UNTIMED if untimed else MemoryConfig.TIMED,
+        dram_bytes_per_cycle=bandwidth,
+        dram_access_latency_cycles=latency,
+        mode=MemoryConfig.BANKED if banked else MemoryConfig.INDEPENDENT,
+        scratchpad_size=config.scratchpad_size or 0,
+        num_banks=config.num_banks or 0,
+        bank_width=config.bank_width or 0,
+        scratchpad_offset=config.scratchpad_offset,
+        frequency_ghz=config.frequency,
+    )
 
 
 def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:

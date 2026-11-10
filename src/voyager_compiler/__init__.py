@@ -52,6 +52,7 @@ from voyager_compiler.codegen.transform.bufferize import (
     bufferize_graph,
     flush_tensor_files,
     gen_code_bufferized,
+    gen_memory_config,
     plan_memory,
     print_bufferized_graph,
     print_layer_table,
@@ -271,6 +272,8 @@ def transform(
     # A null config (no hardware) skips padding and tiling.
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
+    if config.pe_array_size is not None:
+        config.timing
 
     if not keep_fp32:
         remove_fp32_casts(model)
@@ -285,9 +288,13 @@ def transform(
     fuse_quantize_dequantize_with_producer(model)
 
     if config.pe_array_size is not None:
-        pad_matrix_op_dimensions(model, config.pe_array_size)
+        pad_matrix_op_dimensions(
+            model,
+            config.pe_array_size,
+            skip_first_conv=config.matrix_backend == 0,
+        )
 
-    if layout_policy == "systolic":
+    if layout_policy in ("systolic", "cim"):
         normalize_conv2d_layout(model)
 
     normalize_gemm_weight_layout(
@@ -351,6 +358,8 @@ def compile(
     """
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
+    if config.pe_array_size is not None:
+        config.timing
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -380,6 +389,12 @@ def compile(
         f.write(text_format.MessageToString(params))
     with open(os.path.join(output_dir, "layers.txt"), "w") as f:
         f.write(print_layer_table(model, params, to_string=True))
+    with open(os.path.join(output_dir, "memory_config.txt"), "w") as f:
+        f.write(text_format.MessageToString(gen_memory_config(config)))
+
+    if config.timing_profile is not None:
+        with open(os.path.join(output_dir, "timing_profile.json"), "w") as f:
+            f.write(config.timing.document)
 
     flush_tensor_files()
     return params

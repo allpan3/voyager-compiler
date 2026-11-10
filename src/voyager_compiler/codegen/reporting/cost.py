@@ -2,8 +2,9 @@
 
 Compute cycles are driven by the **anchor only** — a fused ``call_module``'s
 anchor (GEMM/conv) and its pointwise tail run pipelined, so the anchor
-dominates.  DRAM bytes apply to ``async_copy`` only (``insert`` is zero-time
-DPS bookkeeping).  Byte counts use the physical storage dtype via
+dominates. A bare matrix result routed through the vector unit occupies both
+units too. DRAM bytes apply to ``async_copy`` only; ``insert`` adds no
+transfer. Byte counts use the physical storage dtype via
 ``dtype_byte_size`` (sub-byte / quantized aware), so packed formats report
 their real footprint.
 """
@@ -17,15 +18,19 @@ from torch.fx import GraphModule, Node
 from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_anchor_node,
+    get_arg_value,
     is_conv2d,
     is_depthwise_conv,
     is_fully_connected,
     is_gemm_op,
+    is_nop,
     is_pooling,
 )
 from voyager_compiler.codegen.reporting.model import OpInfo
+from voyager_compiler.codegen.transform.tiling.cim import issue_window
 from voyager_compiler.codegen.transform.tiling.cost import (
     gemv_lanes,
+    get_dtype_width,
     pool_taps,
     vector_op_utilization,
 )
@@ -89,6 +94,8 @@ def tile_bytes(buffer_node: Node, sizes) -> int:
 
 
 def dram_cycles(n_bytes: int, cost: AcceleratorConfig) -> int:
+    if cost.dram_untimed:
+        return 0
     # GB/s == bytes/ns, so n_bytes / dram_bandwidth is the transfer time in ns;
     # add the access latency (ns) and convert to cycles with frequency (GHz).
     time_ns = cost.dram_access_latency + n_bytes / cost.dram_bandwidth
@@ -115,7 +122,7 @@ def op_utilization(
 
     Everything else runs on the vector unit; ``vector_op_utilization`` (shared
     with the vector L2-tiling cost model) charges it, at
-    ``cost.bytes_per_cycle`` SRAM bandwidth -- including the fully-connected
+    ``cost.bank_width`` bytes per cycle -- including the fully-connected
     case, which it sizes by the streamed weight and its bank switches over
     the anchor's shape, the tile once bufferized, and a pool, whose fetch it
     walks for bank switches over the anchor's input tile.  ``ideal_cycles``
@@ -142,10 +149,36 @@ def op_utilization(
 # --------------------------------------------------------------------------
 
 
+def _output_via_vector(node: Node) -> bool:
+    """Read the destination's routing marker through shape-only views.
+
+    Split-K's first bare partial uses a pass-through vector operation so the
+    next partial's vector read waits for its store. It is part of the matrix
+    stream, not a second pass that reads the result from scratchpad.
+    """
+    pending, seen = [node], set()
+    while pending:
+        value = pending.pop()
+        if value in seen:
+            continue
+        seen.add(value)
+        for user in value.users:
+            if (
+                user.op == "call_function"
+                and user.target is torch.ops.voyager.insert.default
+                and user.args[0] is value
+            ):
+                if get_arg_value(user, 2, "output_via_vector", False):
+                    return True
+            elif user.op == "call_function" and is_nop(user):
+                pending.append(user)
+    return False
+
+
 def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
     """Classify a compute node and compute its ideal (100%-utilization) cycle
-    count.  GEMM/conv use the ``unroll[0]*unroll[1]`` systolic throughput;
-    vector ops use the ``unroll[1]`` lane count.
+    count. GEMM/conv use the matrix lane count and backend issue interval;
+    vector ops use the vector-unit lane count.
 
     All shapes come from the *anchor* -- the real GEMM/conv/vector op (inside
     the submodule for a fused ``call_module``, the node itself when bare).  Its
@@ -155,13 +188,23 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
     """
     anchor = get_anchor_node(node)
     mma_macs = max(1, cost.pe_array_size[0] * cost.pe_array_size[1])
+    mma_interval = (
+        issue_window(cost, get_dtype_width(_dtype(anchor.args[0])))
+        if cost.matrix_backend == 1
+        and is_gemm_op(anchor)
+        and not is_fully_connected(anchor)
+        else 1
+    )
     vec_lanes = max(1, cost.vector_lanes)
     out = _shape(anchor)
 
-    # A fused submodule drives the vector unit too (its tail runs on the VU,
-    # even a bare reshape); a bare matrix op occupies only the matrix unit.
+    # A fused tail and a pass-through destination both use the vector start/
+    # done gate. Charging the producer keeps the stream pipelined and makes
+    # its commit post wait for vector completion without a second DMA.
     fused = isinstance(node.meta.get("submodule"), GraphModule)
-    matrix_units = ("mma", "vector") if fused else ("mma",)
+    matrix_units = (
+        ("mma", "vector") if fused or _output_via_vector(node) else ("mma",)
+    )
 
     if is_conv2d(anchor):
         w = _shape(anchor.args[1])
@@ -174,7 +217,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
         else:  # OIHW = [K, C, kh, kw]
             c, kh, kw = w[1], w[2], w[3]
         macs = math.prod(out) * c * kh * kw
-        ideal = math.ceil(macs / mma_macs)
+        ideal = math.ceil(macs * mma_interval / mma_macs)
         return OpInfo(
             node.name,
             "conv",
@@ -188,6 +231,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
             },
             units=matrix_units,
             utilization=op_utilization(node, matrix_units, ideal, cost),
+            useful_work_fraction=node.meta.get("useful_work_fraction", 1.0),
         )
 
     if is_gemm_op(anchor):
@@ -199,7 +243,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
         # matrix-vector or the vector unit (``gemv_lanes``), not the array.
         fc = is_fully_connected(anchor)
         divisor = gemv_lanes(anchor, cost) if fc else mma_macs
-        ideal = math.ceil(macs / divisor)
+        ideal = math.ceil(macs * mma_interval / divisor)
         units = ("vector",) if fc else matrix_units
         return OpInfo(
             node.name,
@@ -214,6 +258,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
             },
             units=units,
             utilization=op_utilization(node, units, ideal, cost),
+            useful_work_fraction=node.meta.get("useful_work_fraction", 1.0),
         )
 
     # Vector op: work is the larger of input / output element count -- a
